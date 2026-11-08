@@ -43,7 +43,12 @@ class AudioRecordSource(
         if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
             record.startRecording()
         }
-        Log.i(TAG, "Capture routedFrom=${record.routedDevice?.type}")
+        // Only a diagnostic: an AudioRecord handed over by an audio policy
+        // (see [CallRedirection]) is fed by a mix rather than by a device, and
+        // the framework answers that question with null or not at all.  The
+        // recording state below is what decides whether the source works.
+        val from = try { "routedFrom=${record.routedDevice?.type}" } catch (_: Throwable) { "routedFrom=n/a" }
+        Log.i(TAG, "Capture $from")
         return record.recordingState == AudioRecord.RECORDSTATE_RECORDING
     }
 

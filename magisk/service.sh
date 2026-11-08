@@ -343,9 +343,55 @@ if [ -n "$ALSA_CARDS" ]; then
     log -t "$TAG" "ALSA cards: $ALSA_CARDS"
 fi
 
+# ── Hidden API policy (Exynos 990 / call redirection) ─────
+# The call-redirection route the S20+ profile uses is built from
+# android.media.AudioPolicy / AudioMix / AudioMixingRule.  None of those are in
+# the SDK (javap on android-36's android.jar reports "class not found"), so the
+# app reaches them by reflection, and ART's hidden-API enforcement refuses the
+# lookup for an app process.  Only 'hidden_api_policy' and
+# 'hidden_api_blacklist_exemptions' appear as settings keys in the framework, so
+# that is the one to flip; it is global, so it is gated to the device that needs
+# it rather than left off for every handset the module installs on.
+#
+# The same is not needed on the Exynos 9820: that route is tinypcm over root and
+# never reflects into the framework.
+if [ "$(getprop ro.hardware 2>/dev/null)" = "exynos990" ]; then
+    # Backgrounded and boot-waited, like the permission block above: service.sh
+    # runs in late_start, which is still early enough for SettingsProvider not to
+    # be answering, and a `settings put` that lands before that provider has read
+    # its table is simply lost again at the next start.  So: wait, write, read it
+    # back, and retry until the read-back agrees.  One unverified write is not
+    # enough here — the whole call-redirection route depends on this integer, and
+    # the app's own check only reports the failure, it cannot fix it.
+    (
+        wait_for_pm
+        BEFORE=$(settings get global hidden_api_policy 2>/dev/null | tr -d '\r')
+        AFTER=""
+        tries=0
+        while [ $tries -lt 5 ]; do
+            tries=$((tries + 1))
+            settings put global hidden_api_policy 0 2>/dev/null
+            AFTER=$(settings get global hidden_api_policy 2>/dev/null | tr -d '\r')
+            [ "$AFTER" = "0" ] && break
+            sleep 3
+        done
+        if [ "$AFTER" = "0" ]; then
+            log -t "$TAG" "hidden_api_policy: ${BEFORE:-unset} -> 0 (read back after $tries try)"
+        else
+            log -t "$TAG" "hidden_api_policy: still ${AFTER:-unset} after $tries tries — app cannot reach AudioPolicy"
+        fi
+    ) &
+fi
+
 # ── Log privileged permission status ──────────────────
 PERM_DUMP=$(dumpsys package "$PKG" 2>/dev/null)
-for PERM in CAPTURE_AUDIO_OUTPUT MODIFY_PHONE_STATE READ_PRIVILEGED_PHONE_STATE CALL_PRIVILEGED; do
+# The last three are the call-redirection gate: CALL_AUDIO_INTERCEPTION is what
+# AudioService checks when an app registers a mix that takes over a call's own
+# streams.  They are signature|privileged, so 'NOT GRANTED' here means the
+# priv-app allowlist entry or the APK in system/priv-app is not the one that got
+# scanned at boot.
+for PERM in CAPTURE_AUDIO_OUTPUT MODIFY_PHONE_STATE READ_PRIVILEGED_PHONE_STATE CALL_PRIVILEGED \
+            CALL_AUDIO_INTERCEPTION CAPTURE_VOICE_COMMUNICATION_OUTPUT MODIFY_AUDIO_ROUTING; do
     if echo "$PERM_DUMP" | grep -q "$PERM.*granted=true"; then
         log -t "$TAG" "$PERM: GRANTED"
     else

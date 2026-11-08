@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import com.callagent.gateway.RootShell
+import com.callagent.gateway.UplinkRouteSetting
 
 /**
  * Auto-starts the gateway service on device boot.
@@ -155,6 +156,18 @@ class BootReceiver : BroadcastReceiver() {
 
                 // NOTE: boot-time AudioRecord priming was removed.
                 // AudioRecord init is handled in RtpSession at call time.
+
+                // The GSM uplink route knob, on the same early-boot thread.
+                // GatewayService also applies it at every bring-up; doing it here
+                // too is what makes the certified route survive a device restart
+                // even while the gateway itself is still waiting on system
+                // services, and it covers the ACTION_MY_PACKAGE_REPLACED case,
+                // where the app was upgraded and nobody typed the setting again.
+                // The write is idempotent: GatewayService's pass afterwards reads
+                // the value, finds it already right, and spends no root command.
+                UplinkRouteSetting.ensureApplied(context, "device boot") { msg ->
+                    Log.i(TAG, msg)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Early permission setup failed: ${e.message}")
             }

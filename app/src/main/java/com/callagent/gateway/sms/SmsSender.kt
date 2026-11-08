@@ -6,6 +6,7 @@ import android.content.Intent
 import android.telephony.SmsManager
 import android.telephony.SubscriptionManager
 import android.util.Log
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Hands an outbound SMS to the modem and keeps the paperwork straight.
@@ -23,6 +24,17 @@ object SmsSender {
     const val EXTRA_PART = "sms_part"
 
     /**
+     * Request codes, never reused.
+     *
+     * Started high and monotonically increasing rather than derived from the
+     * message id: a process that dies mid-send leaves its PendingIntents
+     * registered with the system, and a fresh instance starting its codes at 0
+     * would hand the same code to an unrelated message and, with
+     * FLAG_UPDATE_CURRENT, rewrite the still-pending one's extras.
+     */
+    private val nextRequestCode = AtomicInteger((System.currentTimeMillis() and 0x3FFFFFFF).toInt())
+
+    /**
      * Send one queued message.  Returns false if the modem refused it outright,
      * in which case nothing will ever call back and the caller must report the
      * failure itself.
@@ -32,6 +44,17 @@ object SmsSender {
             val manager = smsManagerFor(context, sms.subId)
             val parts = manager.divideMessage(sms.text)
             val count = parts.size
+            if (count == 0) {
+                // Nothing to send (an empty body is the usual cause), and the
+                // modem will not call back for a part that does not exist, so
+                // this has to be settled here or the row waits out its day in
+                // silence.  Returning false makes the caller report the failure.
+                Log.w(TAG, "Nothing to dispatch for ${sms.id}: the modem split it into no parts")
+                SmsOutbox.update(context, sms.id) {
+                    it.copy(sentFailed = 1, lastError = "empty message")
+                }
+                return false
+            }
 
             SmsOutbox.update(context, sms.id) { it.copy(parts = count) }
 
@@ -97,7 +120,16 @@ object SmsSender {
             putExtra(EXTRA_ID, id)
             putExtra(EXTRA_PART, part)
         }
-        val requestCode = (id.hashCode() * 31 + part) * 2 + if (action == ACTION_SENT) 0 else 1
+        // A request code out of a counter that never repeats, not one derived
+        // from the id.  Two different messages whose ids collide on `hashCode()*31
+        // + part` (which a hash does, and ids from two builds make collisions
+        // cheaper to find) used to get the *same* PendingIntent for the same
+        // part, and with FLAG_UPDATE_CURRENT the second send rewrote the first
+        // one's extras: the callback for a message the server is waiting on then
+        // reported a different message, and the first one sat unreported until it
+        // expired.  The extras still name the message and the part — the code is
+        // only what keeps two PendingIntents apart.
+        val requestCode = nextRequestCode.getAndIncrement().toInt()
         return PendingIntent.getBroadcast(
             context, requestCode, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE

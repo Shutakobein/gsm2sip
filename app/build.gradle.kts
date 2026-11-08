@@ -11,8 +11,20 @@ android {
         applicationId = "com.callagent.gateway"
         minSdk = 26
         targetSdk = 34
-        versionCode = 457
-        versionName = "1.4.18"
+        // 472 / 1.4.33: the gateway now applies its own uplink route knob —
+        // `callagent_uplink_via=0` is written through the existing root shell at
+        // bring-up and at boot (`UplinkRouteSetting`), instead of being typed in by
+        // hand from ADB.  Audio behaviour is unchanged: 0 is what the code already
+        // used when the key was absent, and the staged playback writer
+        // (`PlaybackWriter`, `callagent_play_stage`) and the `stage=`/`wr:`/`played=`
+        // counters on the RTP stats line are byte for byte what 471 ran.
+        //
+        // The number moves because a field run has to be able to say which build a
+        // stats line came from — `posture.ps1` prints this pair — and because the
+        // bring-up lines named `Uplink route:` only exist from here on.  It is not a
+        // behaviour claim.
+        versionCode = 472
+        versionName = "1.4.33"
     }
 
     // A release build is signed with the same debug key the debug build uses.
@@ -50,6 +62,14 @@ android {
 
     kotlinOptions {
         jvmTarget = "1.8"
+    }
+
+    // The unit tests under app/src/test run on a plain JVM, where android.util.Log
+    // is a stub whose methods throw "not mocked" unless the harness makes them
+    // return defaults instead.  Code under test logs — that is not a reason to
+    // put a phone in the loop for a parser test.
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 }
 

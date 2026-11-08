@@ -18,6 +18,18 @@
     <!-- System permission: enables AudioRecord(VOICE_CALL) on rooted device -->
     <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT"
         tools:ignore="ProtectedPermissions" />
+    <!-- System permissions: take the call's own AudioFlinger streams over with
+         an audio policy (see DeviceProfile.callRedirect, RtpSession.startCallRedirect).
+         All three are signature|privileged|role, so they are granted only because
+         this app is installed as a priv-app with an entry in
+         privapp-permissions-gateway.xml; CALL_AUDIO_INTERCEPTION is the one the
+         framework's own call-redirection gate checks. -->
+    <uses-permission android:name="android.permission.CALL_AUDIO_INTERCEPTION"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.CAPTURE_VOICE_COMMUNICATION_OUTPUT"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_ROUTING"
+        tools:ignore="ProtectedPermissions" />
 
     <!-- Phone / GSM call control -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />

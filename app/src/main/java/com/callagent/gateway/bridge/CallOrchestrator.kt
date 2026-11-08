@@ -12,6 +12,7 @@ import android.util.Log
 import com.callagent.gateway.RootShell
 import com.callagent.gateway.gsm.GsmCallManager
 import com.callagent.gateway.rtp.RtpPacket
+import com.callagent.gateway.rtp.CallRedirection
 import com.callagent.gateway.rtp.SrtpContext
 import com.callagent.gateway.rtp.RtpSession
 import com.callagent.gateway.rtp.DtmfDetector
@@ -54,6 +55,26 @@ class CallOrchestrator(
     private var activeRtpSession: RtpSession? = null
     private var activeSipCall: SipCall? = null
     private var activeGsmCall: Call? = null
+    /** The call-redirection policy armed for the GSM leg this flow is about to
+     *  dial.  Only the SIP-initiated outbound flow sets it, and only before
+     *  [GsmCallManager.makeCall] — see [preArmCallRedirect] for why the order is
+     *  the whole point.  Owned here until [startRtp] hands it to the RTP
+     *  session, which then owns it; [closePendingCallRedirect] is what withdraws
+     *  it if no bridge ever came up. */
+    private var pendingCallRedirect: CallRedirection? = null
+    /** The UDP socket our own SDP names.
+     *
+     *  Bound by [openRtpSocket] *before* the SDP that advertises it goes out, and
+     *  kept open until [startRtp] hands it to the RTP session, which then owns it.
+     *  Every path that ends a bridge without a session having taken it must call
+     *  [closeMediaSocket].  See [openRtpSocket] for why probing a port and
+     *  closing it again is not the same thing. */
+    private var mediaSocket: DatagramSocket? = null
+    /** Guards [mediaSocket] on its own.  tearDown() is @Synchronized on this
+     *  object and blocks for seconds inside session.stop(); sharing that monitor
+     *  with the socket helpers would delay them by the same amount, and the
+     *  socket has to be releasable at any moment. */
+    private val mediaLock = Any()
     /** False while the previous RTP/HAL session is still being released. */
     @Volatile private var audioReady = true
 
@@ -113,6 +134,21 @@ class CallOrchestrator(
             if (state == Call.STATE_DISCONNECTING || state == Call.STATE_DISCONNECTED) {
                 Log.i(TAG, "GSM watchdog detected call end (state=$state)")
                 tearDown("GSM call disconnected")
+                return@watchdog
+            }
+
+            // The state above is a copy Telecom delivered to us and keeps.  If
+            // the telephony stack stopped talking to this Call object — the
+            // session ended, another dialer took the call, the radio released
+            // it without a final callback — that copy is frozen at ACTIVE and
+            // this watchdog would trust it for ever, with the bridge stuck in
+            // BRIDGED and every later caller told "busy".  Telecom's own list
+            // is the one that cannot go stale.
+            val telecom = GsmCallManager.telecomCallStates()
+            if (telecom != null && telecom.none { it != Call.STATE_DISCONNECTED }) {
+                Log.w(TAG, "GSM watchdog: Telecom holds no call (tracked object says state=$state) " +
+                        "— the cellular leg ended without telling us")
+                tearDown("GSM call gone from Telecom")
             }
         }, 250, 250, TimeUnit.MILLISECONDS)
     }
@@ -272,6 +308,17 @@ class CallOrchestrator(
         BRIDGED,             // Both sides active, audio flowing
         GSM_DIALING,         // Outbound: dialing GSM number
         TEARING_DOWN         // Hanging up
+    }
+
+    /** How an incoming GSM call is met while the bridge is not IDLE.
+     *  Produced by [decideIncoming], and tested there as a table.
+     *
+     *  [RESET_AND_REJECT] is the half-way answer: a leg really is up, so this
+     *  caller is told busy, but the bridge is incomplete (the other leg is gone),
+     *  so it is cleared on the way — a caller is allowed to hear busy once, and
+     *  not for as long as the process lives. */
+    internal enum class IncomingAction {
+        ACCEPT, RESET_AND_ACCEPT, RESET_AND_REJECT, REJECT_BUSY, IGNORE_DUPLICATE
     }
 
     fun start() {
@@ -598,16 +645,55 @@ class CallOrchestrator(
 
         // onCallAdded() and the first STATE_RINGING callback can describe the
         // same Telecom call. Do not reject the call as a duplicate.
-        if (activeGsmCall === call && bridgeState != BridgeState.IDLE &&
-            bridgeState != BridgeState.TEARING_DOWN) {
-            Log.d(TAG, "Ignoring duplicate ringing callback for the same GSM call (state=$bridgeState)")
-            return
+        val gsmLive = GsmCallManager.hasLiveCall()
+        val sipLive = activeSipCall?.let { it.state != SipCall.State.TERMINATED } == true
+        val ageMs = System.currentTimeMillis() - lastStateChangeTime
+        val action = decideIncoming(bridgeState, activeGsmCall === call, gsmLive, sipLive, ageMs)
+        if (action == IncomingAction.REJECT_BUSY || action == IncomingAction.RESET_AND_REJECT) {
+            // Everything busy is decided from these numbers, so a logcat taken
+            // on site is enough to say which of them was wrong.  The phone
+            // number is deliberately not in it.
+            Log.w(TAG, "Incoming GSM call met with $action — state=$bridgeState, " +
+                    "gsm=${if (gsmLive) "live" else "gone"}, sip=${if (sipLive) "live" else "gone"}, " +
+                    "${ageMs / 1000}s in this state, telecom calls=${GsmCallManager.telecomCallStates()}")
         }
+        when (action) {
+            IncomingAction.IGNORE_DUPLICATE -> {
+                Log.d(TAG, "Ignoring duplicate ringing callback for the same GSM call (state=$bridgeState)")
+                return
+            }
 
-        if (bridgeState != BridgeState.IDLE) {
-            Log.w(TAG, "Busy — rejecting GSM call")
-            GsmCallManager.rejectCall(call)
-            return
+            IncomingAction.REJECT_BUSY -> {
+                // Only a genuinely concurrent call gets this far: both legs of a
+                // bridge, or one leg inside the timeout.  Busy is what callers
+                // reported hearing on calls that were not concurrent at all, so
+                // the reason is said out loud.
+                GsmCallManager.rejectCall(call)
+                return
+            }
+
+            // BRIDGED with one leg already dead: this caller hears busy, and the
+            // dead bridge is taken away so the next one does not.
+            IncomingAction.RESET_AND_REJECT -> {
+                forceReset(
+                    "bridge claims BRIDGED with gsm=${if (gsmLive) "live" else "gone"} and " +
+                        "sip=${if (sipLive) "live" else "gone"} — clearing it, and this caller is " +
+                        "told busy because a line is still up"
+                )
+                GsmCallManager.rejectCall(call)
+                return
+            }
+
+            // Non-IDLE with nothing live behind it is a wedged bridge, not a
+            // busy one.  Clearing it costs nothing that was still working, and
+            // not clearing it told every later caller they had reached a busy
+            // number — permanently, until the process restarted.
+            IncomingAction.RESET_AND_ACCEPT -> forceReset(
+                "bridge wedged in $bridgeState for ${ageMs / 1000}s with gsm=${if (gsmLive) "live" else "gone"} " +
+                    "and sip=${if (sipLive) "live" else "gone"} — accepting this call instead of rejecting it"
+            )
+
+            IncomingAction.ACCEPT -> Unit
         }
 
         sipCallRetries = 0
@@ -709,15 +795,30 @@ class CallOrchestrator(
                     // Answer the SIP call off the main thread
                     Thread({
                         activeSipCall?.let { sipCall ->
-                            val rtpPort = allocateRtpPort()
-                            sipCall.listener = this
-                            sipCall.accept(rtpPort)
+                            try {
+                                // The socket this call's SDP will name, bound now and
+                                // held: the peer starts sending as soon as it reads
+                                // our 200 OK, so the port has to be listening before
+                                // that 200 OK is even written.
+                                val sock = openRtpSocket()
+                                val rtpPort = sock.localPort
+                                sipCall.listener = this
+                                sipCall.accept(rtpPort)
 
-                            val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
-                            val port = sipCall.remoteRtpPort
-                            val pt = sipCall.negotiatedPayloadType
-                            if (port > 0) {
-                                startRtp(rtpPort, addr, port, pt)
+                                val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
+                                val port = sipCall.remoteRtpPort
+                                val pt = sipCall.negotiatedPayloadType
+                                if (port > 0) {
+                                    startRtp(rtpPort, addr, port, pt)
+                                } else {
+                                    closeMediaSocket("peer SDP carried no media port")
+                                }
+                            } catch (t: Throwable) {
+                                // An uncaught throw here takes the process, and the
+                                // registration with it.  Fail this call instead.
+                                Log.e(TAG, "Outbound bridge failed: $t", t)
+                                closeMediaSocket("outbound bridge failed")
+                                tearDown("outbound bridge failed: ${t.javaClass.simpleName}")
                             }
                         }
                         Log.i(TAG, "Outbound bridge established")
@@ -806,6 +907,19 @@ class CallOrchestrator(
         }
     }
 
+    /** Telecom has unbound the InCallService.
+     *
+     *  What usually causes that is the dialer role changing — being made, or
+     *  unmade, the default dialer.  Whatever GSM leg an open bridge was holding
+     *  can no longer be observed, answered or disconnected, so the bridge would
+     *  keep a state that nothing can move and meet every later caller with a
+     *  busy signal.  Closing it here is the difference between a role change and
+     *  a gateway that has to be restarted. */
+    override fun onInCallServiceGone() {
+        if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) return
+        forceReset("InCallService unbound while the bridge was in $bridgeState")
+    }
+
     // ── SipCall.Listener ────────────────────────────────
 
     override fun onCallAnswered(call: SipCall) {
@@ -888,7 +1002,8 @@ class CallOrchestrator(
         bridgeState = BridgeState.SIP_CALLING
         listener?.onStateChanged(bridgeState, "Calling Asterisk for $callerNumber")
 
-        val rtpPort = allocateRtpPort()
+        val sock = openRtpSocket()
+        val rtpPort = sock.localPort
         val sipCall = sipClient.makeCall(
             targetExtension = inboundSipDestination(gsmCall),
             localRtpPort = rtpPort,
@@ -941,10 +1056,71 @@ class CallOrchestrator(
         // Telecom in SELECT_PHONE_ACCOUNT, which a headless gateway cannot
         // answer.  A single-SIM gateway dials on its SIM whatever the CID is,
         // or without one — makeCall decides.
+        //
+        // And before the dial, on the Exynos 990: arm the call-redirection
+        // route.  AudioFlinger decides whether a client belongs to a policy mix
+        // when the client is *created*, and the two clients that carry a call on
+        // this device are created by the modem's media path the moment the call
+        // starts.  Mixes registered once the call is ACTIVE own nothing: the
+        // sink reads digital silence and the injector has no record client to
+        // feed.  Measured on air with build 459 (2026-11-05): one call ran with
+        // capRMS=0 for its whole duration and an AudioTrack write timeout on
+        // every frame written, while the call before it captured the caller
+        // properly — the only difference was whether the call's two clients
+        // happened to be created after the registration.  The stand-alone
+        // harness that proved both directions on this device registered the
+        // policy and then dialled, in that order, so what is being copied here
+        // is the ordering, not a new mechanism.
+        pendingCallRedirect = preArmCallRedirect()
+
         val cid = sipCall.callerNumber?.trim()?.takeIf { it.isNotEmpty() }
         if (!GsmCallManager.makeCall(context, gsmDestination, cid, headless = true)) {
             Log.e(TAG, "Cannot dial GSM: SIP Outbound CID ${cid ?: "missing"} does not select a unique SIM")
+            closePendingCallRedirect()
             tearDown("No matching SIM for Outbound CID", 503 to "No Matching SIM")
+        }
+    }
+
+    /**
+     * Registers the call-redirection policy and opens its two streams while no
+     * call is up, which is what has to precede the dial.  The mix's sink reads
+     * silence until the call's own playback client is matched into it, and the
+     * injector reaches nobody: neither stream touches the handset, so arming
+     * early puts no sound anywhere and changes nothing a caller can hear.
+     *
+     * Returns null when the profile has no such route (every device but the
+     * Exynos 990) or when the framework refuses the registration.  That is not
+     * fatal: with nothing handed over, [RtpSession.startCallRedirect] still
+     * registers the policy itself when the GSM leg answers — the ordering that
+     * worked on some calls, and the one this replaces.
+     */
+    private fun preArmCallRedirect(): CallRedirection? {
+        val route = GsmCallManager.profile.callRedirect ?: return null
+        if (!CallRedirection.hiddenApiOpen(context)) {
+            Log.w(TAG, "Pre-arm skipped: hidden-API enforcement is on in this process")
+            return null
+        }
+        if (!CallRedirection.probe()) return null
+        val gw = CallRedirection.open(context, route.mixRate, route.wantInjector) ?: return null
+        if (!gw.start(route.mixRate)) {
+            Log.w(TAG, "Pre-arm: policy streams did not come up; withdrawing before the dial")
+            gw.close()
+            return null
+        }
+        Log.i(TAG, "Pre-armed call redirect before the dial: rate=${route.mixRate} " +
+            "injector=${gw.hasInjector} uplink=${gw.uplinkRoute} mixes=[${gw.registeredMixes()}]")
+        return gw
+    }
+
+    /** Withdraws a policy armed for a call that never reached a bridge: the dial
+     *  was refused, the SIP caller cancelled, or the GSM leg never answered.
+     *  Leaving the mixes registered would hand the next call streams belonging
+     *  to a call that no longer exists. */
+    private fun closePendingCallRedirect() {
+        pendingCallRedirect?.let { armed ->
+            pendingCallRedirect = null
+            armed.close()
+            Log.i(TAG, "Pre-armed call redirect withdrawn: no bridge adopted it")
         }
     }
 
@@ -984,7 +1160,8 @@ class CallOrchestrator(
                 }
             }
         }
-        val session = RtpSession(context, localPort, remoteAddr, remotePort, payloadType)
+        val session = RtpSession(context, localPort, remoteAddr, remotePort, payloadType,
+            takeMediaSocket(localPort))
 
         // DTMF from the SIP side → the GSM call, so IVR menus work.  Accept
         // the payload type the server named in its SDP as well as our own 101.
@@ -1043,6 +1220,14 @@ class CallOrchestrator(
                 listener?.onRtpStats(stats)
             }
         }
+        // Hand over the policy that was registered before this call was dialled,
+        // and give up ownership with it: from here the session's own stop() path
+        // withdraws it, and tearDown() must not, because the session may be
+        // mid-teardown at this very moment.
+        pendingCallRedirect?.let { armed ->
+            pendingCallRedirect = null
+            session.preArmedRedirect = armed
+        }
         // Published before start() so a teardown arriving mid-setup can find
         // and stop it rather than leaving an orphaned session holding the
         // audio devices and the RTP socket.
@@ -1078,6 +1263,19 @@ class CallOrchestrator(
                 it.stop()
             }
             activeRtpSession = null
+
+            // A policy armed before the dial that no session ever adopted (this
+            // teardown arrived while the GSM leg was still dialling) is ours to
+            // withdraw.  Once a session has taken it, pendingCallRedirect is
+            // already null and that session's stop() path closes it.
+            closePendingCallRedirect()
+
+            // A media socket the bridge opened for an SDP but no RTP session ever
+            // took (call failed while GSM was dialling, peer never answered, peer
+            // SDP carried no media port) is ours to release.  Left open it holds a
+            // port no dialog uses any more, and SO_REUSEADDR elsewhere would call
+            // that port free again.
+            closeMediaSocket("bridge torn down")
 
             activeSipCall?.let {
                 try {
@@ -1121,6 +1319,11 @@ class CallOrchestrator(
             activeGsmCall = null
             pendingIncoming = null
             pendingRtpAddr = null
+            // Cleared with the rest: an old local port left here is a port some
+            // later flow might start RTP on that no SDP of ours ever named.
+            pendingLocalRtpPort = 0
+            pendingRtpPort = 0
+            pendingPayloadType = 0
         } finally {
             bridgeState = BridgeState.IDLE
             generation++
@@ -1133,30 +1336,98 @@ class CallOrchestrator(
     // ── Utility ─────────────────────────────────────────
 
     /**
-     * Pick a free even UDP port for RTP.
+     * Bind a free even UDP port for RTP and **keep the socket**.
      *
-     * The scan starts at a random offset rather than always at 30000.  The
-     * port is probed by binding and closing, so there is a gap before
-     * RtpSession binds it for real; starting from the same place every time
-     * meant consecutive calls raced each other for the very same port, which
-     * is the one way that gap reliably loses.
+     * The old version bound a probe socket, closed it and returned the number.
+     * That number then went into the SDP while the RTP session went off to bind
+     * the port again, up to a second later.  Two ways that loses, both measured:
+     *
+     *  - Between the close and the real bind, nothing at all is listening on the
+     *    port the peer has just been told about.  A conforming peer starts
+     *    sending the moment it reads the 200 OK.  Air measurement with build 466
+     *    (2026-11-06, out\uac-ac6): the host wrote 703 frames to the advertised
+     *    192.168.0.6:33642 and the session logged rx=0 for the entire call.
+     *  - The probe asked for the port with SO_REUSEADDR, which on Linux succeeds
+     *    even when one of our own sockets still holds it, so it does not prove
+     *    the port is free — and two sockets on one port means the kernel picks
+     *    one of them to deliver to.
+     *
+     * Holding the socket instead fixes both: the port is exclusively ours (no
+     * SO_REUSEADDR here) from the instant the SDP leaves until the session takes
+     * it over, and the port the SDP names is read back from the socket itself,
+     * so it cannot be a number nothing owns.
      */
-    private fun allocateRtpPort(): Int {
+    private fun openRtpSocket(): DatagramSocket {
+        // One bridge at a time: if a previous flow left a socket behind, that
+        // flow is over and its port is not ours to keep.
+        closeMediaSocket("replaced by a new bridge")
         val span = (RTP_PORT_MAX - RTP_PORT_MIN) / 2
         val start = (Math.random() * span).toInt()
+        var lastError: Exception? = null
         for (i in 0 until span) {
             val port = RTP_PORT_MIN + ((start + i) % span) * 2
             try {
-                DatagramSocket(null).use { sock ->
-                    sock.reuseAddress = true
-                    sock.bind(InetSocketAddress(port))
-                    return port
+                val sock = DatagramSocket(null).apply {
+                    // Deliberately NOT reuseAddress: exclusivity is the point, and
+                    // a probe that accepts a port someone already holds is the
+                    // other half of the bug above.
+                    bind(InetSocketAddress(port))
                 }
-            } catch (_: Exception) {
+                synchronized(mediaLock) { mediaSocket = sock }
+                // What the kernel bound, not what we asked for: an SDP must name
+                // the socket's own port.
+                Log.i(TAG, "RTP socket held on port ${sock.localPort} for this call's SDP " +
+                        "(bound on ${sock.localSocketAddress})")
+                return sock
+            } catch (e: Exception) {
+                lastError = e
                 continue
             }
         }
-        throw RuntimeException("No free RTP port available")
+        throw RuntimeException("No free RTP port available (${lastError?.message})")
+    }
+
+    /** Releases the held media socket if no RTP session has taken it. */
+    private fun closeMediaSocket(why: String) {
+        val sock: DatagramSocket? = synchronized(mediaLock) {
+            val s = mediaSocket
+            mediaSocket = null
+            s
+        }
+        if (sock == null) return
+        try { sock.close() } catch (_: Exception) {}
+        Log.i(TAG, "RTP socket on port ${sock.localPort} closed: $why")
+    }
+
+    /**
+     * The media socket for the port this call's SDP named, or null if the socket
+     * is gone (a re-INVITE moved the port, or the flow that opened it ended).
+     * Taking it clears the field: from here the RTP session owns the socket and
+     * its stop() path closes it.
+     */
+    private fun takeMediaSocket(expectedPort: Int): DatagramSocket? {
+        val held = synchronized(mediaLock) {
+            val s = mediaSocket
+            if (s != null && s.localPort == expectedPort && !s.isClosed) {
+                mediaSocket = null
+                s
+            } else null
+        }
+        if (held != null) {
+            Log.i(TAG, "Handing the RTP socket on port ${held.localPort} to the session that " +
+                    "carries the call whose SDP named it")
+            return held
+        }
+        val current = synchronized(mediaLock) { mediaSocket }
+        if (current != null) {
+            // A port nobody's SDP advertises any more (a re-INVITE moved it) must
+            // not stay held: it is one more port the peer will never be told
+            // about, and the probe would later call it free.
+            closeMediaSocket("not the SDP port $expectedPort (this one is on ${current.localPort})")
+        } else {
+            Log.w(TAG, "No held RTP socket for SDP port $expectedPort — the session has to bind it itself")
+        }
+        return null
     }
 
     /**
@@ -1252,6 +1523,12 @@ class CallOrchestrator(
         activeGsmCall = null
         pendingIncoming = null
         pendingRtpAddr = null
+        pendingLocalRtpPort = 0
+        // Same reason as in tearDown(), stated once: a recovery path that clears
+        // the dialog without releasing what it opened leaves a port bound that no
+        // dialog advertises, and an AudioPolicy mix registered over nothing.
+        closePendingCallRedirect()
+        closeMediaSocket("bridge force-reset")
         diallerInitiated = false
         bridgeState = BridgeState.IDLE
         generation++
@@ -1263,6 +1540,50 @@ class CallOrchestrator(
     companion object {
         private const val TAG = "CallOrchestrator"
         private const val SIP_CALL_TIMEOUT_MS = 30_000L
+
+        /** Whether an incoming GSM call is accepted, taken over after a reset,
+         *  met with busy, or ignored as a second report of the call already
+         *  being handled.
+         *
+         *  The code this replaces asked one question — is the bridge IDLE — and
+         *  answered busy to everything else.  Any bridge whose teardown never
+         *  finished therefore told every caller of this SIM "the line is busy"
+         *  for as long as it lasted, which is exactly what was reported from the
+         *  field on 2026-11-06 just after the app was made the default dialer.
+         *
+         *  What makes a non-IDLE bridge real is one of two live legs: a GSM call
+         *  Telecom has not finished, or a SIP dialog that has not terminated.
+         *  With neither, the state is left over from something that already
+         *  ended.  A state that has not reached BRIDGED within
+         *  [STALE_STATE_TIMEOUT_MS] is left over too — every legitimate
+         *  non-BRIDGED state is resolved by a timeout inside 70 s (see
+         *  [SIP_RING_MAX_MS], the longest honest wait in the machine).
+         *
+         *  A BRIDGED call is never reset on age alone: two sides are talking and
+         *  the third caller really is hearing a busy line.  But BRIDGED is a
+         *  claim of *two* live legs, and when only one of them is still there the
+         *  state is not a call — the cellular side is connected to nothing, or
+         *  the SIP dialog is ringing into a call that has already ended.  Such a
+         *  bridge is cleared, and the caller waiting in front of it is met with
+         *  [IncomingAction.RESET_AND_REJECT]: busy this time, because a line
+         *  genuinely is up, but never busy again afterwards. */
+        internal fun decideIncoming(
+            state: BridgeState,
+            sameCallAsTracked: Boolean,
+            liveGsm: Boolean,
+            liveSip: Boolean,
+            ageMs: Long,
+            staleMs: Long = STALE_STATE_TIMEOUT_MS,
+        ): IncomingAction = when {
+            state == BridgeState.IDLE -> IncomingAction.ACCEPT
+            sameCallAsTracked -> IncomingAction.IGNORE_DUPLICATE
+            !liveGsm && !liveSip -> IncomingAction.RESET_AND_ACCEPT
+            state == BridgeState.BRIDGED && !(liveGsm && liveSip) ->
+                IncomingAction.RESET_AND_REJECT
+            state != BridgeState.BRIDGED && ageMs > staleMs -> IncomingAction.RESET_AND_ACCEPT
+            else -> IncomingAction.REJECT_BUSY
+        }
+
         /** Safety net once the server reports ringing (its own dial timeout normally ends it first). */
         private const val SIP_RING_MAX_MS = 70_000L
         private const val GSM_DIAL_TIMEOUT_MS = 45_000L

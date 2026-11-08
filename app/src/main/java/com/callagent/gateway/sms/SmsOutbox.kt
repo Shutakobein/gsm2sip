@@ -1,6 +1,7 @@
 package com.callagent.gateway.sms
 
 import android.content.Context
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -44,6 +45,7 @@ data class OutboundSms(
  * that forgot what it sent could neither report nor refuse to send it twice.
  */
 object SmsOutbox {
+    private const val TAG = "SmsOutbox"
     private const val PREFS = "sms_outbox"
     private const val KEY = "messages"
 
@@ -58,7 +60,11 @@ object SmsOutbox {
         val all = read(context).toMutableList()
         if (all.any { it.id == sms.id }) return
         all.add(sms)
-        write(context, all.takeLast(MAX_ENTRIES))
+        // Overflow: throw away what is already finished and reported before
+        // throwing away anything the server is still waiting to hear about.
+        val trimmed = if (all.size <= MAX_ENTRIES) all
+        else (all.filterNot { it.finalReported }.ifEmpty { all }).takeLast(MAX_ENTRIES)
+        write(context, trimmed)
     }
 
     @Synchronized
@@ -110,10 +116,18 @@ object SmsOutbox {
 
     private fun read(context: Context): List<OutboundSms> {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val arr = JSONArray(prefs.getString(KEY, "[]"))
-        return (0 until arr.length()).mapNotNull { i ->
-            runCatching { fromJson(arr.getJSONObject(i)) }.getOrNull()
+        val raw = prefs.getString(KEY, "[]") ?: return emptyList()
+        val rows = try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).mapNotNull { arr.opt(it) as? JSONObject }
+        } catch (e: Exception) {
+            // Same reasoning as SmsStore: one damaged row must not take the
+            // whole outbox down with it.  These rows are the only record the
+            // gateway has of what it promised the server it would send.
+            Log.e(TAG, "Unreadable outbox: ${e.message} — salvaging what parses")
+            JsonArrayRows.parse(raw)
         }
+        return rows.mapNotNull(::fromJson).filter { it.id.isNotEmpty() }
     }
 
     private fun write(context: Context, list: List<OutboundSms>) {

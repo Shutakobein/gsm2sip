@@ -37,6 +37,15 @@ class SmsReceiver : BroadcastReceiver() {
         val text = parts.joinToString("") { it.displayMessageBody ?: it.messageBody ?: "" }
         val receivedAt = parts[0].timestampMillis
 
+        if (text.isEmpty()) {
+            // No text at all: a WAP push, a message addressed to the SIM rather
+            // than to the user, or a multipart PDU the platform could not
+            // decode.  There is nothing to hand on — and a blank MESSAGE would
+            // put an empty row in the server's log for an SMS nobody received.
+            Log.w(TAG, "SMS from $sender carries no text (${parts.size} part(s)) — not forwarded")
+            return
+        }
+
         // Which SIM took it.  Two extra names are in circulation and OEMs
         // disagree about which they set, so try both before giving up.
         val subId = intent.getIntExtra(

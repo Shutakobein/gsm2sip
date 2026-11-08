@@ -8,6 +8,22 @@
         <!-- Audio: capture telephony audio streams (VOICE_CALL, VOICE_DOWNLINK) -->
         <permission name="android.permission.CAPTURE_AUDIO_OUTPUT" />
 
+        <!-- Audio: take the call's own AudioFlinger streams over with an
+             AudioPolicy (DeviceProfile.callRedirect, RtpSession.startCallRedirect).
+             Used on the Exynos 990 / S20+, whose HAL offers no in-call capture and
+             whose kernel will not carry the ALSA route the S10e uses.
+               CALL_AUDIO_INTERCEPTION            registers the mixes that match a
+                                                  call's usage/preset
+               CAPTURE_VOICE_COMMUNICATION_OUTPUT the players mix's sink actually
+                                                  carries the call's downlink
+               MODIFY_AUDIO_ROUTING               registering an AudioPolicy at all
+             All three are signature|privileged, so this entry plus the APK being
+             in system/priv-app is what grants them; declaring them in the manifest
+             without listing them here would fail the boot-time allowlist scan. -->
+        <permission name="android.permission.CALL_AUDIO_INTERCEPTION" />
+        <permission name="android.permission.CAPTURE_VOICE_COMMUNICATION_OUTPUT" />
+        <permission name="android.permission.MODIFY_AUDIO_ROUTING" />
+
         <!-- Telephony: read IMEI, precise call state, modify phone state -->
         <permission name="android.permission.READ_PRIVILEGED_PHONE_STATE" />
         <permission name="android.permission.READ_PRECISE_PHONE_STATE" />

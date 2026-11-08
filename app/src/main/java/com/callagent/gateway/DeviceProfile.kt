@@ -107,6 +107,17 @@ data class DeviceProfile(
      *  null everywhere else.  See [RootPcmRoute]. */
     val rootPcm: RootPcmRoute? = null,
 
+    /** Carry the call over the framework's call-redirection AudioPolicy: two
+     *  mixes that take over the call's own AudioFlinger clients, and the sink
+     *  and source streams they hand us.  null everywhere else.
+     *
+     *  This is a third route, alongside [rootPcm] and the HAL's own: it does
+     *  not go through the HAL at all, and unlike rootPcm it needs no kernel
+     *  module and no ALSA front-end — it is applied above AudioFlinger, to
+     *  streams the telephony media path already has open.  See
+     *  [CallRedirectRoute] and [com.callagent.gateway.rtp.CallRedirection]. */
+    val callRedirect: CallRedirectRoute? = null,
+
     /** `key=value` HAL parameters set through AudioManager.setParameters()
      *  once the call is up and before the playback track is created.
      *
@@ -178,6 +189,19 @@ data class DeviceProfile(
      *  MSM8930: 0 (muted via tinymix muteVoiceRx).
      *  Exynos 9820: higher value needed for mic-based acoustic capture. */
     val voiceCallVolPercent: Int = 0,
+
+    /** Let the gateway set STREAM_VOICE_CALL / STREAM_MUSIC levels for a call.
+     *
+     *  True on every device whose call audio the gateway reaches through the
+     *  HAL, where the stream volume is one of the things that has to be right
+     *  for the route to exist at all.
+     *
+     *  False where the call is tapped as an AudioFlinger *client* (see
+     *  [callRedirect]): the downlink reaches us as a live playback stream, so
+     *  setting that stream to zero or muting it removes the signal at the same
+     *  moment we are trying to read it.  The same goes for `silenceLocalAudio`,
+     *  which is why a profile using this keeps that off too. */
+    val manageStreamVolumes: Boolean = true,
 
     /** AudioTrack usage attribute for playback (agent→caller).
      *  USAGE_MEDIA (default): Maps to STREAM_MUSIC.  Works with Qualcomm
@@ -314,6 +338,35 @@ data class DeviceProfile(
      * stale TELEPHONY_TX stream.
      */
     val audioStopSettleDelayMs: Long = 0,
+
+    // ── Silencing the handset's own speaker (Rx) during a bridge ──
+
+    /** Shell command that stops the call's downlink being played by the handset.
+     *
+     *  Only ever run when the operator turns it on (`settings put global
+     *  callagent_silence_rx 1`), and reverted on the way back.
+     *
+     *  The reason this exists is the "robotic repetition" report of 2026-11-06.
+     *  On the Exynos 990 the uplink is carried by the framework call-redirection
+     *  policy, which takes over the call's *own* AudioFlinger clients (see
+     *  [CallRedirectRoute] and [com.callagent.gateway.rtp.CallRedirection]) — so
+     *  muting the microphone, or the framework mic mute, would cut the injected
+     *  agent leg as well (see the v2.8.50 note in GsmCallManager).  What can be
+     *  silenced instead is the far end of the call: if the caller's voice is
+     *  still coming out of the earpiece, the room picks it up again and the
+     *  remote party hears their own speech back, processed, which is what a
+     *  doubled-up, robotic signal reads like.
+     *
+     *  Empty = this profile has nothing to do it with, which is every profile
+     *  whose bridge already works through the HAL: those inject digitally and
+     *  the handset speaker is not in the path.  This is a diagnostic lever for
+     *  one device, not a general feature. */
+    val rxSilenceCmd: String = "",
+
+    /** Puts [rxSilenceCmd] back, run when the control is switched off and at
+     *  the end of every call that applied it.  Read back and logged, because a
+     *  mute left behind would take the earpiece away from ordinary phone use. */
+    val rxRestoreCmd: String = "",
 
     /** Delay (ms) for appops propagation on cold boot. */
     val appopsPropagationMs: Long,
@@ -513,6 +566,20 @@ data class DeviceProfile(
                 // Samsung Galaxy S10e Exynos (Exynos 9820)
                 board.contains("exynos9820") || hw.contains("exynos") && model.contains("sm-g970") ->
                     exynos9820()
+
+                // Samsung Galaxy S20+ (Exynos 990, "y2s").  Matched on the chip
+                // rather than the model so the other 990 phones (S20, S20 Ultra,
+                // Note 20) get the same route, and matched *before* the generic
+                // Exynos branch, which would otherwise put them on the HAL path
+                // this firmware cannot serve.
+                //
+                // It is not the S10e's route either: same vendor, same ABOX
+                // family, but this kernel does not survive the position-reporting
+                // module that route needs.  See exynos990().
+                board.contains("exynos990") || platform == "exynos990" ||
+                    hw.contains("exynos990") || socModel.contains("exynos990") ||
+                    device == "y2s" || model.contains("sm-g98") ->
+                    exynos990()
 
                 // Snapdragon 7-series (SM6150/SM7150) with WCD9375 codec —
                 // e.g. Poco X3 NFC.  Same incall_music path as MSM8930 but a
@@ -874,6 +941,133 @@ data class DeviceProfile(
             // hears.  The minimum the other profiles use would starve it.
             voiceCallVolPercent = 70,
             routeChangeDelayMs = 0,
+            appopsPropagationMs = 300,
+        )
+
+        /** Samsung Galaxy S20+ (Exynos 990, "y2s"), LineageOS: both directions
+         *  digital, taken over above AudioFlinger with a call-redirection
+         *  AudioPolicy instead of through the HAL or the DSP.
+         *
+         *  Like the S10e's HAL, this one offers nothing to work with: no
+         *  telephony device in its audio policy, no incall_music, no in-call
+         *  capture — every AudioRecord telephony source reads silence and every
+         *  playback track stays on the speaker.  Unlike the S10e, the ABOX
+         *  route cannot replace that either: driving its routing matrix needs
+         *  the position-reporting kernel module, and on this kernel that module
+         *  panics the device on load.  So [rootPcm] is deliberately null here.
+         *
+         *  The call audio is still there, one level up.  Measured on this
+         *  device while a call was up, the modem's IMS media path carries it as
+         *  two ordinary AudioFlinger clients:
+         *
+         *    downlink  a playback client, usage VOICE_COMMUNICATION, 8 kHz mono
+         *    uplink    a record client owned by com.android.phone, capture
+         *              preset VOICE_COMMUNICATION, 8 kHz mono
+         *
+         *  A policy with a players mix matching that usage hands the caller to
+         *  an AudioRecord sink of ours, and an injector mix matching that
+         *  preset makes the modem's record client read from an AudioTrack of
+         *  ours.  Both directions were proven this way on this device with the
+         *  stand-alone harness before anything here was written.
+         *
+         *  What that implies for the rest of this profile:
+         *    - nothing to mute and nothing to route, so every mixer command is
+         *      empty and `silenceLocalAudio`/`requireSpeakerMode` are off;
+         *    - `manageStreamVolumes` off, because the downlink we read *is* a
+         *      live stream: setting STREAM_VOICE_CALL to zero, or muting it the
+         *      way silenceLocalAudio does, takes the signal away at the same
+         *      moment we are tapping it;
+         *    - the microphone is not in the path at all (the injector replaces
+         *      what the modem reads), so there is no echo from our own playback
+         *      and no acoustic fallback worth falling back to: the sink is the
+         *      only source, and an air test that quietly switched to a
+         *      microphone would not be measuring this route any more.
+         *
+         *  The last bullet was falsified on 2026-11-07 and is kept only to show what
+         *  was believed then.  Measured on a live call, three dumps each (gate+4.0,
+         *  +16.6, +18.5 s): the modem reads its uplink out of one
+         *  AUDIO_SOURCE_VOICE_COMMUNICATION record client owned by the IMS media
+         *  process (pid 7981, uid 1001), and that client's input device follows
+         *  `callagent_uplink_via` - 0x80000004 BUILTIN_MIC at 1, 0x80000100
+         *  IN_REMOTE_SUBMIX at 0.  With the shipped value 1 the microphone *is* the
+         *  uplink and it is never silent (no sample below -54 dBFS for the whole
+         *  call), so our own playback reaches the far end through the air and the
+         *  "acoustic fallback" is not a fallback, it is the route.  The fields below
+         *  are deliberately unchanged: they were judged against what a far end heard,
+         *  and re-deriving them from this note would be a different measurement. */
+        fun exynos990() = DeviceProfile(
+            name = "Exynos 990 (S20+, call redirection)",
+            callRedirect = CallRedirectRoute(mixRate = 8000),
+            rootPcm = null,
+            rootCapture = null,
+            // No ALSA work on this device: the policy is the whole route, and
+            // the vendor's own amp/mic switches are left exactly as they are.
+            mixerSetupCmd = "",
+            mixerRestoreCmd = "",
+            mixerIncallMusicCmd = "",
+            mixerVerifyCmd = "",
+            musicVolPercent = 0,       // not applied: manageStreamVolumes = false
+            voiceCallVolPercent = 0,   // ditto
+            manageStreamVolumes = false,
+            silenceLocalAudio = false,
+            captureGain = 1,
+            playbackGain = 1,
+            // This gain was set against the far end's judgement on 2026-11-06
+            // ("my voice is low on other end"), when this route was believed to
+            // write into the modem's record client.  On 2026-11-07 the shipped
+            // uplink_via=1 was measured instead: that record client reads
+            // BUILTIN_MIC, so what the far end hears of this gain is the sound of
+            // the handset's own receiver picked up by its own microphone, with the
+            // platform's AEC/NS chains and the network codec between them.  +3 dB is
+            // one step of the user's own live trim (AGENT_GAIN_FACTORS goes
+            // 1.0 → 1.4), kept where the listener judged it; the soft limiter's knee
+            // (24576) absorbs the peaks this lifts.  Whether the acoustic route needs
+            // more, less or none is open, and only a far end can say.
+            playbackGainDb = 3.0,
+            noiseGateThreshold = 0,
+            echoGateThreshold = 300,
+            doubleTalkRatio = 1.5f,
+            // Kept false, and now for a measured reason rather than an assumed one:
+            // in every archived run the 852/1336 Hz tone the bridge emitted was
+            // never seen in the app's own sink tap, and on the uplink_via=0 call the
+            // remote-submix capture showed no sign of it either - no bucket anywhere
+            // passed the tone detector, and the press window only rose 4.8 dB above
+            // the surrounding median.  Nothing of ours has ever come back into the
+            // sink in any witness taken.
+            playbackLeaksIntoCapture = false,
+            // This source is the only acceptable one: falling back to a
+            // microphone would be a different route, not a degraded one.
+            silenceFallback = false,
+            captureSilenceFrames = 1000,
+            // The field report of 2026-11-06 complained of static on this leg,
+            // and hard phrase onsets are part of what makes a burst of that
+            // reading: each frame the reservoir starts to refill after a gap
+            // opens at full amplitude.  5 ms of ramp (40 samples at 8 kHz) is
+            // cheap — it only ever touches the samples after a seam — and it is
+            // the same treatment the other profiles already use.
+            playbackFadeIn = true,
+            requireSpeakerMode = false,
+            incallMusicParam = "",
+            voiceDownlinkWorks = false,
+            routeChangeDelayMs = 0,
+            // Silencing the earpiece is what the "robotic repetition" complaint
+            // points at, not the microphone: on this route the mic *is* the
+            // uplink carrier (CallRedirection's own witness: the injector track
+            // is routed to "Remote Submix Out" and the mic reaches the call
+            // inside the DSP), so a mic mute would take the agent's voice away
+            // too.  What can be silenced instead is the downlink at the DSP, so
+            // the caller's own speech stops coming out of the handset and being
+            // picked up again.  Nothing is written unless the operator sets
+            // `settings put global callagent_silence_rx 1`, and every write is
+            // read back and logged.
+            //
+            // 'ABOX Speech Rx Mute' (control 626 of card 0, Picasso-Prince) is
+            // Samsung's own mute of the call's downlink; it reads 0 with the
+            // call path running.  Card 0 is named explicitly — cards 1 and 2 on
+            // this SoC are aboxvdma and aboxdump, and a tinymix that picked the
+            // first card it found would address the wrong chip.
+            rxSilenceCmd = "tinymix -D 0 'ABOX Speech Rx Mute' 1",
+            rxRestoreCmd = "tinymix -D 0 'ABOX Speech Rx Mute' 0",
             appopsPropagationMs = 300,
         )
 
@@ -1414,4 +1608,33 @@ data class RootCapture(
     val rate: Int,
     val setupCmd: String = "",
     val restoreCmd: String = "",
+)
+
+/**
+ * Call audio taken over above AudioFlinger: an [android.media.AudioPolicy]
+ * (not public, reflected in [com.callagent.gateway.rtp.CallRedirection]) with
+ * two mixes, plus the sink and source streams the framework creates for them.
+ *
+ * Nothing here needs root, and nothing here touches a mixer: the route is
+ * applied to the streams the telephony media path already has open, which is
+ * why it works on a firmware whose HAL exposes no telephony output and whose
+ * kernel will not carry the ALSA route in [RootPcmRoute].
+ *
+ * It does need three signature-level permissions — CALL_AUDIO_INTERCEPTION,
+ * CAPTURE_VOICE_COMMUNICATION_OUTPUT, MODIFY_AUDIO_ROUTING — which only a
+ * privileged system app with an allowlist entry is granted, and it needs
+ * hidden-API enforcement off for the app process (`settings put global
+ * hidden_api_policy 0`), because none of these classes are in the SDK at all.
+ */
+data class CallRedirectRoute(
+    /** Sample rate the mixes, the sink and the source are all built at.
+     *  8000: measured on the device as the rate both of the call's own clients
+     *  run at, and the geometry the injection was proven at, so nothing in the
+     *  path resamples. */
+    val mixRate: Int = 8000,
+
+    /** Register the injector mix as well as the players mix — without it there
+     *  is a call the agent can hear and nobody on the other end can answer.
+     *  Off only to measure the downlink alone. */
+    val wantInjector: Boolean = true,
 )

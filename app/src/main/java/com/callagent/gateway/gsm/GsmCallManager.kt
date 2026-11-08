@@ -38,6 +38,18 @@ object GsmCallManager {
 
     private const val TAG = "GsmCallManager"
 
+    /** Switch that asks for the handset's own downlink to be muted during a
+     *  bridge (see [applyRxSilenceIfRequested]).  Written by hand, from a shell:
+     *      settings put global callagent_silence_rx 1
+     *  Read once per call setup, so it applies to the next call rather than the
+     *  one in progress.  0 = never touch anything, which is the default. */
+    private const val SETTING_SILENCE_RX = "callagent_silence_rx"
+
+    /** Read-back of the mute this profile writes, logged before and after so a
+     *  control that is absent, or that the firmware overwrites again, is visible
+     *  in the call log instead of inferred. */
+    private const val RX_SILENCE_CHECK = "tinymix -D 0 'ABOX Speech Rx Mute'"
+
 
     /** Active device profile — initialized on first use. */
     val profile: DeviceProfile by lazy { DeviceProfile.detect() }
@@ -103,6 +115,90 @@ object GsmCallManager {
         fun onGsmCallStateChanged(call: Call, state: Int)
         /** GSM call ended */
         fun onGsmCallEnded(call: Call)
+        /** Telecom unbound our InCallService: no GSM call can be observed any
+         *  more, and none of the Call objects we hold can be trusted.
+         *
+         *  This happens every time the dialer role changes, which is exactly
+         *  when the app is made the default dialer.  A bridge that was open at
+         *  that moment keeps its state but loses every way of learning that its
+         *  GSM leg went away, and it then answers "busy" to each later caller
+         *  for ever.  Reported from the field 2026-11-06. */
+        fun onInCallServiceGone() {}
+    }
+
+    /** True while a GSM call that Telecom has not finished is being tracked.
+     *
+     *  The bridge asks this before it tells a caller "busy": a non-IDLE bridge
+     *  with nothing live behind it is wedged, not busy.
+     *
+     *  The Call object's own state is the fresher of the two signals we have;
+     *  [activeCallState] only moves on a callback.  When the object has been
+     *  unbound from it can throw, and the answer then is "live" — a wrong "live"
+     *  is corrected by the stale-bridge path a minute later, while a wrong
+     *  "dead" would drop a call that is genuinely up. */
+    fun hasLiveCall(): Boolean {
+        val call = activeCall ?: return false
+        val fresh = try {
+            call.state
+        } catch (t: Throwable) {
+            Log.w(TAG, "Call state unreadable (InCallService unbound?): $t — treating as live")
+            null
+        }
+        val telecom = telecomCallStates()
+        val live = isCallLive(fresh, activeCallState, telecom)
+        if (!live && fresh != null && fresh != Call.STATE_DISCONNECTED) {
+            // The interesting case, and the one that was reported from the field:
+            // the Call object still says ACTIVE while Telecom holds no call at
+            // all.  Left alone, that one object answers "busy" to every caller
+            // of this SIM for the rest of the process's life.
+            Log.w(TAG, "Tracked GSM call looks live (state=$fresh) but Telecom has no call " +
+                    "(list=${telecom}) — the call object is stale")
+        }
+        return live
+    }
+
+    /**
+     * The states of the calls the bound InCallService is actually holding.
+     *
+     * `InCallService.getCalls()` is Telecom's own list, maintained by
+     * InCallAdapter, not a snapshot copied into a [Call] object.  It is the only
+     * way to find out that a call we are tracking ended without ever being
+     * told so — [Call.getState] keeps reporting the last state that was
+     * delivered to us, and if the call was taken by another dialer, or the
+     * session ended, nothing more is ever delivered.
+     *
+     * null means "no InCallService is bound, so this question has no answer".
+     * An empty list means "there is no call", which is an answer.
+     */
+    fun telecomCallStates(): List<Int>? {
+        val svc = inCallService ?: return null
+        return try {
+            svc.calls.orEmpty().map { it.state }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Telecom call list unreadable: $t")
+            null
+        }
+    }
+
+    /** [hasLiveCall] without the telecom plumbing, so the rule can be tested. */
+    internal fun isCallLive(
+        trackedState: Int?,
+        callbackState: Int,
+        telecomStates: List<Int>?,
+    ): Boolean {
+        val objectSays = when {
+            trackedState == null -> true            // unreadable: assume live, the stale path fixes it later
+            trackedState == Call.STATE_NEW ->
+                callbackState != Call.STATE_NEW && callbackState != Call.STATE_DISCONNECTED
+            else -> trackedState != Call.STATE_DISCONNECTED
+        }
+        // Telecom is used as a veto, never as a booster.  If it holds no call,
+        // then no call is live, however fresh the object in our hand looks; if
+        // it does hold one, we still ask the object, because "a call exists" is
+        // not the same as "the call we are bridging exists".
+        if (telecomStates != null && telecomStates.none { it != Call.STATE_DISCONNECTED })
+            return false
+        return objectSays
     }
 
     // ── InCallService callbacks ─────────────────────────
@@ -190,6 +286,16 @@ object GsmCallManager {
         if (inCallService === service) {
             inCallService = null
             Log.i(TAG, "InCallService unbound")
+            // Nothing can report this call's state any more, and a Call object
+            // from an unbound InCallService cannot be answered, muted or
+            // disconnected.  Drop the references and tell the bridge, so a
+            // half-open bridge cannot sit there calling every later caller busy.
+            if (activeCall != null) {
+                Log.w(TAG, "Dropping GSM call reference with no InCallService to report it")
+                activeCall = null
+                activeCallState = Call.STATE_NEW
+            }
+            listener?.onInCallServiceGone()
         }
     }
 
@@ -663,6 +769,7 @@ object GsmCallManager {
                             Thread.sleep(profile.routeChangeDelayMs)
                             enforceVolumes(am)
                             batchMixerSetup()
+                            applyRxSilenceIfRequested()
                         } catch (_: Exception) {}
                     }, "VolEnforce").start()
 
@@ -704,6 +811,20 @@ object GsmCallManager {
      *  Called multiple times: immediately, after delayed route change,
      *  and from RtpSession as a secondary safeguard. */
     fun enforceVolumes(am: AudioManager) {
+        if (!profile.manageStreamVolumes) {
+            // See DeviceProfile.manageStreamVolumes.  On a device whose call is
+            // taken over above AudioFlinger, the caller reaches us as a live
+            // playback client: STREAM_VOICE_CALL's volume is a gain applied to
+            // the very signal being captured, and ADJUST_MUTE mutes it at the
+            // same moment.  Nothing here must touch the call's own levels.
+            try {
+                appLog("Vol: left alone (route above AudioFlinger): " +
+                    "voice=${am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)}, " +
+                    "music=${am.getStreamVolume(AudioManager.STREAM_MUSIC)}")
+            } catch (_: Exception) {}
+            return
+        }
+
         // Clear any stale ADJUST_MUTE flag from a previous call.
         // CRITICAL: Do NOT use ADJUST_MUTE on STREAM_VOICE_CALL — on
         // MSM8930 it kills the incall_music injection path, preventing
@@ -798,15 +919,22 @@ object GsmCallManager {
                     // the next ordinary call on this phone has a live earpiece.
                     for (p in profile.halCallParamsRestore) am.setParameters(p)
 
-                    // Unmute voice call stream and restore volume for normal phone use
-                    try {
-                        try { am.isMicrophoneMute = false } catch (_: Exception) {}
-                        am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
-                    } catch (_: SecurityException) {}
-                    try {
-                        val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-                        am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVc * 2 / 3).coerceAtLeast(1), 0)
-                    } catch (_: SecurityException) {}
+                    // Unmute voice call stream and restore volume for normal phone use.
+                    // Skipped where the profile never touched them (see
+                    // DeviceProfile.manageStreamVolumes): on a route above
+                    // AudioFlinger this runs while the policy's streams may still
+                    // be draining, and a write here is a gain change on the
+                    // signal being captured, not a repair of anything we broke.
+                    if (profile.manageStreamVolumes) {
+                        try {
+                            am.isMicrophoneMute = false
+                            am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+                        } catch (_: SecurityException) {}
+                        try {
+                            val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVc * 2 / 3).coerceAtLeast(1), 0)
+                        } catch (_: SecurityException) {}
+                    }
                     Log.i(TAG, "Audio restored: earpiece, VoiceRx unmuted, echoRef=SLIM_RX, incall_music=false")
                 }
             }
@@ -856,6 +984,7 @@ object GsmCallManager {
 
     /** Restore mixer state when call ends using the device profile. */
     fun batchMixerRestore() {
+        revertRxSilence()
         if (profile.mixerRestoreCmd.isEmpty()) {
             Log.i(TAG, "batchMixerRestore: no mixer commands for ${profile.name}")
             return
@@ -870,6 +999,137 @@ object GsmCallManager {
             appLog("Mixer restored")
         } catch (e: Exception) {
             appLog("Mixer restore FAILED: ${e.message}")
+        }
+    }
+
+    // ── Silencing the handset's own earpiece while a bridge is up ──
+
+    /** What to do with the handset downlink mute when a call is set up.
+     *  Computed by [decideRxSilence], and tested there as a table. */
+    internal enum class RxSilence { APPLY, REVERT, LEAVE_ALONE }
+
+    /** One root shell command's worth of work: run it, then read [checkCmd] back.
+     *  null means tinymix is not available, so the command could not be resolved. */
+    internal data class RxMixerOp(val command: String, val checkCmd: String)
+
+    /** The single control that decides all of this, in one place so a logcat line
+     *  naming it says everything: [SETTING_SILENCE_RX] is the operator's switch,
+     *  [RxMixerOp] says whether this device has a way to obey it.
+     *
+     *  [REVERT] on its own when the switch is turned off between calls: whatever
+     *  the last call muted has to be given back, or the next ordinary phone call
+     *  reaches the user with no earpiece at all. */
+    internal fun decideRxSilence(on: Boolean, op: RxMixerOp?, appliedOutstanding: Boolean): RxSilence =
+        when {
+            op == null -> RxSilence.LEAVE_ALONE          // nothing on this device to write
+            on -> RxSilence.APPLY
+            appliedOutstanding -> RxSilence.REVERT       // switch turned off between calls
+            else -> RxSilence.LEAVE_ALONE
+        }
+
+    /** Whether the downlink mute is currently outstanding. */
+    @Volatile private var rxSilenceApplied = false
+
+    @Volatile private var rxSilenceWarned = false
+
+    /** Writes the profile's mute control, but only if:
+     *   - the profile has one (only exynos990 does — every other route injects
+     *     digitally and the handset speaker is not in the path), and
+     *   - the operator turned [SETTING_SILENCE_RX] on by hand.
+     *
+     *  Off by default on purpose.  The reported symptom is the far end hearing
+     *  their own voice repeated back, and this is the control that can prove or
+     *  disprove that reading — but the far end's ear is the only judge, so the
+     *  switch is there to be A/B'd on a live call, and never set by the app. */
+    private fun applyRxSilenceIfRequested() {
+        val op = rxMixerOp()
+        if (op == null) {
+            // Either this profile has no such control (all of them but this one)
+            // or tinymix could not be resolved right now; the setting asked for
+            // something this device cannot do, so say which and change nothing.
+            Log.w(TAG, "Rx silence requested but nothing to write for ${profile.name} " +
+                    "(no control in the profile, or tinymix unavailable)")
+            return
+        }
+        val decision = decideRxSilence(rxSilenceRequested(), op, rxSilenceApplied)
+        when (decision) {
+            RxSilence.LEAVE_ALONE -> {
+                if (!rxSilenceWarned) {
+                    rxSilenceWarned = true
+                    appLog("Rx silence: available but off " +
+                            "(`settings put global $SETTING_SILENCE_RX 1` on a bridge call to try it)")
+                }
+                return
+            }
+            RxSilence.REVERT -> revertRxSilence()
+            RxSilence.APPLY -> Unit
+        }
+        val ctx = inCallService ?: run {
+            Log.w(TAG, "Rx silence requested but no InCallService bound to read the setting")
+            return
+        }
+        try {
+            val check = DeviceProfile.resolveCmd(RX_SILENCE_CHECK)
+            if (check.isNotEmpty()) appLog("Rx mute BEFORE: ${RootShell.execForOutput(check, timeoutMs = 8000)}")
+            val out = RootShell.execForOutput(op.command, timeoutMs = 8000)
+            if (out.isNotBlank()) appLog("Rx silence setup: $out")
+            val after = if (check.isNotEmpty())
+                RootShell.execForOutput(check, timeoutMs = 8000) else "no read-back"
+            // A mute is only believed if the read-back says so: tinymix prints
+            // the control's current value, so the last word of it is the answer.
+            // That makes an ineffective write — control absent, or put back by
+            // the HAL when it re-selects its call path — visible in the log
+            // instead of a silent "we must have muted it" guess.
+            val value = after.trim().split(Regex("\\s+")).lastOrNull() ?: ""
+            rxSilenceApplied = value.isNotEmpty() && value != "0"
+            appLog("Rx silence: applied, read-back [$after] muted=$rxSilenceApplied")
+            Log.w(TAG, "Rx silence: ${profile.rxSilenceCmd} -> read-back [$after] " +
+                    "(the far end's ear is the judge, not this line)")
+        } catch (e: Exception) {
+            rxSilenceApplied = false
+            appLog("Rx silence FAILED: ${e.message}")
+        }
+    }
+
+    /** Gives the earpiece back.  Always safe to call: without a profile command
+     *  or without a mute outstanding there is nothing to undo. */
+    private fun revertRxSilence() {
+        if (!rxSilenceApplied) return
+        val restore = DeviceProfile.resolveCmd(profile.rxRestoreCmd)
+        if (restore.isEmpty()) {
+            Log.w(TAG, "Rx silence outstanding but no restore command for ${profile.name}")
+            return
+        }
+        try {
+            RootShell.execForOutput(restore, timeoutMs = 8000)
+            val after = DeviceProfile.resolveCmd(RX_SILENCE_CHECK).let {
+                if (it.isEmpty()) "no read-back" else RootShell.execForOutput(it, timeoutMs = 8000)
+            }
+            rxSilenceApplied = false
+            appLog("Rx silence reverted, read-back [$after]")
+        } catch (e: Exception) {
+            appLog("Rx silence revert FAILED: ${e.message} — mute may still be set")
+        }
+    }
+
+    /** The resolved mute command plus its read-back, or null when this device
+     *  has no control to write. */
+    private fun rxMixerOp(): RxMixerOp? {
+        if (profile.rxSilenceCmd.isEmpty()) return null
+        val cmd = DeviceProfile.resolveCmd(profile.rxSilenceCmd)
+        if (cmd.isEmpty()) return null
+        return RxMixerOp(cmd, DeviceProfile.resolveCmd(RX_SILENCE_CHECK))
+    }
+
+    /** Read by the shell over a USB cable, and it has to outlive an app update:
+     *  same reasoning, and the same kind of switch, as RtpSession's
+     *  callagent_rtp_gate and callagent_playback_slip. */
+    private fun rxSilenceRequested(): Boolean {
+        val ctx = inCallService?.applicationContext ?: return false
+        return try {
+            android.provider.Settings.Global.getInt(ctx.contentResolver, SETTING_SILENCE_RX, 0) != 0
+        } catch (_: Throwable) {
+            false
         }
     }
 

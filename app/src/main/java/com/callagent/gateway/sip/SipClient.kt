@@ -271,7 +271,22 @@ class SipClient(
     }
 
     private fun handlePacket(data: String, address: Pair<String, Int>) {
-        val msg = SipMessage.parse(data) ?: return
+        val msg = SipMessage.parse(data)
+        if (msg == null) {
+            // This used to be a silent 'return', and the silence is what made a
+            // badly built BYE impossible to see: the peer sent it, the gateway
+            // threw it away, the call stayed up and nothing in the log mentioned
+            // any of it.  Say that a datagram arrived and could not be parsed,
+            // without repeating what it said - on an INVITE the start line is the
+            // number being dialled.
+            val first = data.substringBefore('\n').trim()
+            val method = first.substringBefore(' ', "").take(12)
+            Log.w(TAG, "Discarded an unparseable SIP datagram of ${data.length}B from " +
+                "${address.first}:${address.second} (start line method=$method): no blank line " +
+                "between its headers and its body. If that was a hang-up or a CANCEL, the " +
+                "call is unaffected by it.")
+            return
+        }
 
         // OPTIONS keepalive from server
         if (msg.isRequest && msg.method == "OPTIONS") {

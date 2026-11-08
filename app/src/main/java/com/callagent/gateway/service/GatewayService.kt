@@ -29,9 +29,12 @@ import com.callagent.gateway.GatewayApp
 import com.callagent.gateway.MainActivity
 import com.callagent.gateway.R
 import com.callagent.gateway.RootShell
+import com.callagent.gateway.UplinkRouteSetting
 import com.callagent.gateway.bridge.CallOrchestrator
 import com.callagent.gateway.gsm.GsmCallManager
+import com.callagent.gateway.net.LocalSubnet
 import com.callagent.gateway.net.StunClient
+import com.callagent.gateway.sip.SipBuilder
 import com.callagent.gateway.sip.SipClient
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -404,6 +407,18 @@ class GatewayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         clearStaleInitializing()
+        // Honour the foreground promise on every delivery, whatever the action
+        // and whether or not the gateway is already up.  It used to be answered
+        // only in some branches: `am start-foreground-service` for a service that
+        // was already running fell into the "already running, skipping restart"
+        // guard, returned without startForeground(), and 24 s later the platform
+        // killed the process with ForegroundServiceDidNotStartInTimeException
+        // (measured on 2026-11-06 with build 463, which took the gateway and its
+        // :5062 socket down with it).  Re-posting the notification the service
+        // already has is cheap, legal, and the only answer that satisfies AMS.
+        runCatching {
+            startForeground(activeNotificationId(), buildNotification(notifState))
+        }.onFailure { Log.w(TAG, "startForeground(${intent?.action ?: "no action"}) failed: ${it.message}") }
         when (intent?.action) {
             ACTION_START -> startGateway(intent)
             ACTION_STOP -> stopGateway()
@@ -526,6 +541,7 @@ class GatewayService : Service() {
     /** One flush at a time: arrival, registration and the retry timer can all
      *  fire at once, and sending the same message twice is worse than late. */
     private val smsFlushing = AtomicBoolean(false)
+    @Volatile private var smsFlushAgain = false
     @Volatile private var smsRetryScheduled = false
 
     /**
@@ -535,42 +551,26 @@ class GatewayService : Service() {
      * A message leaves the queue only on a 2xx.  Anything else — no response,
      * a 4xx, SIP not registered — leaves it on disk for the next attempt,
      * because the broadcast that delivered it is not repeatable.
+     *
+     * One pass at a time.  A trigger that arrives while one is running asks the
+     * running thread to look again afterwards ([smsFlushAgain]) instead of
+     * starting a second pass beside it: a pass reads its snapshot when it
+     * starts, so the message that arrived mid-pass is not in it, and without
+     * the re-run that message waits for some unrelated trigger — the next SMS,
+     * or a re-registration — which on a quiet line can be hours.
      */
     private fun flushSmsQueue(reason: String) {
-        if (!smsFlushing.compareAndSet(false, true)) return
+        if (!smsFlushing.compareAndSet(false, true)) {
+            smsFlushAgain = true
+            return
+        }
         thread(name = "sms-flush") {
+            var failed: Boolean
             try {
-                val queue = SmsStore.pending(this)
-                if (queue.isEmpty()) return@thread
-                val sip = sipClient
-                if (sip == null || !sip.registered) {
-                    broadcastLog("SMS: ${queue.size} queued, waiting for registration")
-                    scheduleSmsRetry()
-                    return@thread
-                }
-                broadcastLog("SMS: forwarding ${queue.size} message(s) [$reason]")
-                // The default SMS app keeps its own copy and shows it unread.
-                // Nobody reads this screen, so an unread badge just
-                // accumulates for ever.  Done here rather than in the
-                // receiver: the default app writes its row when it handles
-                // SMS_DELIVER, which may not have happened yet at that point.
-                markInboxRead()
-                var failed = false
-                for (sms in queue) {
-                    val code = sendSmsOverSip(sip, sms)
-                    if (code == 200 || code == 202) {
-                        SmsStore.remove(this, sms.id)
-                        broadcastLog("SMS: ${sms.id} from ${sms.from} accepted ($code)")
-                    } else {
-                        SmsStore.markAttempt(this, sms.id)
-                        broadcastLog(
-                            "SMS: ${sms.id} from ${sms.from} not accepted " +
-                                "(${if (code == 0) "no response" else code.toString()}) — queued"
-                        )
-                        failed = true
-                        break   // keep order; a later one is no more likely to land
-                    }
-                }
+                do {
+                    smsFlushAgain = false
+                    failed = flushPass(reason)
+                } while (smsFlushAgain && !stopped)
                 if (failed) scheduleSmsRetry()
             } catch (e: Exception) {
                 Log.e(TAG, "SMS flush failed: ${e.message}", e)
@@ -579,6 +579,92 @@ class GatewayService : Service() {
                 smsFlushing.set(false)
             }
         }
+    }
+
+    /** One walk of the queue; true if something is still waiting. */
+    private fun flushPass(reason: String): Boolean {
+        announceRetired()
+        val queue = SmsStore.pending(this)
+        if (queue.isEmpty()) return false
+        val sip = sipClient
+        if (sip == null || !sip.registered) {
+            broadcastLog("SMS: ${queue.size} queued, waiting for registration")
+            return true
+        }
+        broadcastLog("SMS: forwarding ${queue.size} message(s) [$reason]")
+        // The default SMS app keeps its own copy and shows it unread.
+        // Nobody reads this screen, so an unread badge just
+        // accumulates for ever.  Done here rather than in the
+        // receiver: the default app writes its row when it handles
+        // SMS_DELIVER, which may not have happened yet at that point.
+        markInboxRead()
+        var failed = false
+        var accepted = 0
+        var held = 0
+        for (sms in queue) {
+            val code = sendSmsOverSip(sip, sms)
+            val why = if (code == 0) "no response" else code.toString()
+            if (code == 200 || code == 202) {
+                SmsStore.remove(this, sms.id)
+                accepted++
+                broadcastLog("SMS: ${sms.id} from ${sms.from} accepted ($code)")
+                continue
+            }
+            failed = true
+            // markAttempt returns null when this attempt was the last one the
+            // store will allow: the message has moved out of the queue and into
+            // the dead-letter list, where the evidence stays.
+            val tried = SmsStore.markAttempt(this, sms.id)
+            if (tried == null) {
+                broadcastLog(
+                    "SMS: ${sms.id} from ${sms.from} not accepted ($why) — " +
+                        "given up on after ${sms.attempts + 1} attempts"
+                )
+                continue
+            }
+            // First failure says so plainly; after that, repeating it on every
+            // 30-second pass is noise, so it is heard again only every 20th
+            // attempt.
+            if (tried.attempts == 1) {
+                broadcastLog("SMS: ${sms.id} from ${sms.from} not accepted ($why) — queued")
+            } else if (tried.attempts % 20 == 0) {
+                broadcastLog("SMS: ${sms.id} from ${sms.from} still not accepted ($why) — attempt ${tried.attempts}")
+            }
+            if (tried.attempts >= SKIP_AFTER_ATTEMPTS) {
+                // Messages of one conversation have to stay in order, so a pass
+                // stops at the first failure — but not for ever.  Something that
+                // has failed this many times in a row is not a fault of the link
+                // (the next message would be hit by it too), it is a fault of
+                // *this* message, and the ones behind it have waited long enough.
+                held++
+                continue
+            }
+            break   // keep order; a later one is no more likely to land
+        }
+        if (held > 0) {
+            broadcastLog("SMS: $held message(s) skipped after repeated failures — $accepted of ${queue.size} accepted this pass")
+        }
+        return failed
+    }
+
+    /**
+     * Say once per service start what earlier attempts gave up on.
+     *
+     * A retired message is otherwise invisible: the queue reads as empty and the
+     * SMS is simply not there.  It is not re-sent — the store has already said
+     * its piece about why — but it has to be said out loud at least once.
+     */
+    @Volatile private var retiredAnnounced = false
+
+    private fun announceRetired() {
+        if (retiredAnnounced) return
+        retiredAnnounced = true
+        val dead = SmsStore.retired(this)
+        if (dead.isEmpty()) return
+        broadcastLog(
+            "SMS: ${dead.size} message(s) retired by earlier attempts, newest " +
+                "${dead.last().id} from ${dead.last().from} after ${dead.last().attempts} attempts"
+        )
     }
 
     private fun scheduleSmsRetry() {
@@ -606,15 +692,17 @@ class GatewayService : Service() {
      * can map an SMS to an assistant exactly as it maps a call.
      */
     private fun sendSmsOverSip(sip: SipClient, sms: PendingSms): Int {
-        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         val configuredOwn = ownNumberForSub(sms.subId)
         val target = sms.to.ifEmpty { configuredOwn }.ifEmpty { cfgUser }
-        val targetUri = "sip:$target@$cfgServer"
+        // The Request-URI user is what the server's dialplan matches, so it must
+        // survive as a number: only what a SIP URI cannot carry at all gets
+        // escaped, and the readable form is repeated in X-SMS-To.
+        val targetUri = "sip:${SipBuilder.encodeSipUser(target)}@$cfgServer"
         val headers = mutableListOf(
             "X-SMS-Id: ${sms.id}",
             "X-SMS-From: ${sms.from}",
             "X-SMS-To: $target",
-            "X-SMS-Received: ${smsTimeFormat.format(java.util.Date(sms.receivedAt))}",
+            "X-SMS-Received: ${smsTimeFormat.format(java.time.Instant.ofEpochMilli(sms.receivedAt))}",
             "X-SMS-Parts: ${sms.parts}"
         )
         if (sms.subId >= 0) headers += "X-SMS-Sim-Sub: ${sms.subId}"
@@ -959,7 +1047,6 @@ class GatewayService : Service() {
             broadcastLog("SMS report $event for ${sms.id} deferred — not registered")
             return false
         }
-        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         val own = ownNumberForSub(sms.subId).ifEmpty { cfgUser }
         val body = org.json.JSONObject().apply {
             put("id", sms.id)
@@ -977,7 +1064,7 @@ class GatewayService : Service() {
             // chance to tell the server either.
             if (sms.smsc.isNotEmpty()) put("smsc", sms.smsc)
             if (sms.encoding.isNotEmpty()) put("encoding", sms.encoding)
-            put("at", smsTimeFormat.format(java.util.Date()))
+            put("at", smsTimeFormat.format(java.time.Instant.now()))
         }.toString()
 
         val headers = mutableListOf(
@@ -985,7 +1072,7 @@ class GatewayService : Service() {
             "X-SMS-Event: $event",
             "X-SMS-To: ${sms.to}",
             "X-SMS-Parts: ${maxOf(sms.parts, 1)}",
-            "X-SMS-At: ${smsTimeFormat.format(java.util.Date())}"
+            "X-SMS-At: ${smsTimeFormat.format(java.time.Instant.now())}"
         )
         if (sms.status.isNotEmpty()) headers += "X-SMS-Status: ${sms.status}"
         if (sms.lastError.isNotEmpty()) headers += "X-SMS-Reason: ${sms.lastError}"
@@ -997,7 +1084,7 @@ class GatewayService : Service() {
         // still JSON for anyone who wants to parse it, but every field is in
         // an X-SMS-* header too, so SIP_HEADER() alone is enough.
         val code = sip.sendSipMessage(
-            targetUri = "sip:$own@$cfgServer",
+            targetUri = "sip:${SipBuilder.encodeSipUser(own)}@$cfgServer",
             fromUser = own,
             body = body,
             extraHeaders = headers,
@@ -1114,8 +1201,21 @@ class GatewayService : Service() {
 
         // Codec preference is a property of the SDP we build, so it has to be
         // in place before the first INVITE goes out.
-        com.callagent.gateway.sip.SipBuilder.codecMode =
-            prefs.getString("codec", "g722") ?: "g722"
+        var codec = prefs.getString("codec", "g722") ?: "g722"
+        // A call taken over above AudioFlinger (DeviceProfile.callRedirect) has
+        // one geometry: the mix's.  G.722 decodes to 16 kHz, and the playback
+        // loop sizes its frames from the codec — so a wideband answer would write
+        // 40 ms of audio into an 8 kHz stream every 20 ms.  Nothing resamples on
+        // that path and RtpSession refuses the call rather than doing it badly,
+        // so on those devices the codec follows the profile.
+        GsmCallManager.profile.callRedirect?.let { route ->
+            if (route.mixRate == 8000 && codec != "g711") {
+                Log.i(TAG, "Codec set to g711: ${GsmCallManager.profile.name} redirects the " +
+                    "call at ${route.mixRate} Hz (preference said $codec)")
+                codec = "g711"
+            }
+        }
+        com.callagent.gateway.sip.SipBuilder.codecMode = codec
 
         // The agent's level into the GSM uplink, as a step away from what the
         // device profile asks for.  Read here so a change applies on save
@@ -1154,6 +1254,15 @@ class GatewayService : Service() {
                 // Magisk su takes 4+ seconds on first invocation (root server
                 // startup).  Must complete before any calls can arrive.
                 forceAllowRecordAudio()
+                // The GSM uplink route knob (`callagent_uplink_via`), applied here
+                // rather than at call time for the same reason as appops: it has to
+                // be in place before SIP registration makes this device reachable
+                // for a call, and a root command must never run during call setup,
+                // where it delays the answer.  A call resolves its route when its
+                // RTP session is built, so this is the last safe moment to state it.
+                UplinkRouteSetting.ensureApplied(
+                    this@GatewayService, "gateway bring-up"
+                ) { msg -> broadcastLog(msg) }
                 initSipClient(gen)
             } finally {
                 initializing.set(false)
@@ -1195,9 +1304,16 @@ class GatewayService : Service() {
         // STUN: discover public IP for NAT traversal.  Optional, because a
         // SIP server on the same network needs no public address at all —
         // advertising one there would point the server at the far side of a
-        // NAT it never has to cross.
+        // NAT it never has to cross.  That is not a hypothetical: on 2026-11-06
+        // with Asterisk at 192.168.0.240 and the phone at 192.168.0.6/24, the
+        // 200 OK we sent carried a public WAN address (203.0.113.97 here, the
+        // documentation-range stand-in for the one STUN had found) and the same address
+        // in `Contact:` — the broadband WAN address STUN had found — and a LAN
+        // peer cannot send an ACK, a BYE or RTP there.
+        val ourNets = LocalSubnet.ourNets()
+        val serverIsLocal = cfgServer.isNotEmpty() && LocalSubnet.serverIsOurs(cfgServer, ourNets)
         val useStun = getSharedPreferences("gateway", MODE_PRIVATE)
-            .getBoolean("use_stun", true)
+            .getBoolean("use_stun", true) && !serverIsLocal
         val stunResult = if (!useStun) null else try {
             StunClient.discover(network = activeNetwork)
         } catch (e: Exception) {
@@ -1206,6 +1322,11 @@ class GatewayService : Service() {
         }
         val publicIp = stunResult?.publicIp ?: localIp
         when {
+            serverIsLocal -> {
+                val chosen = LocalSubnet.bestFor(cfgServer, ourNets)
+                broadcastLog("SIP server $cfgServer is on our own network ($chosen); " +
+                    "STUN skipped, advertising $localIp")
+            }
             !useStun ->
                 broadcastLog("STUN off — direct SIP, advertising $localIp")
             stunResult != null ->
@@ -1258,7 +1379,12 @@ class GatewayService : Service() {
                     onlineSince = System.currentTimeMillis()
                     // Anything that arrived while SIP was down goes now, and
                     // any report the server never acknowledged goes again.
+                    // dispatchOutbox() belongs here too: the server's 202 says
+                    // the *gateway* took the message, so if the process died
+                    // between that answer and the modem, the message is still
+                    // sitting un-dispatched and nobody else would ever look.
                     flushSmsQueue("registered")
+                    dispatchOutbox()
                     sweepOutboxReports()
                 } else if (!registered && state == CallOrchestrator.BridgeState.IDLE) {
                     onlineSince = 0L
@@ -1599,7 +1725,7 @@ class GatewayService : Service() {
         // greppable over adb, which is how these get read when something has
         // already gone wrong and the app is not in front of anyone.
         Log.i(TAG, "LOG: $msg")
-        val stamped = "${bufferTimeFormat.format(java.util.Date())}  $msg"
+        val stamped = "${bufferTimeFormat.format(java.time.Instant.now())}  $msg"
         synchronized(logBuffer) {
             logBuffer.add(stamped)
             if (logBuffer.size > LOG_BUFFER_SIZE) logBuffer.removeAt(0)
@@ -1614,6 +1740,19 @@ class GatewayService : Service() {
     // ── Network ─────────────────────────────────────────
 
     private fun getLocalIp(): String {
+        // First choice: the address on the network that can actually reach the
+        // SIP server.  With mobile data and Wi-Fi both up, the default network
+        // can be the cellular one while a SIP request from a LAN box arrives on
+        // Wi-Fi and the reply goes back out Wi-Fi (the directly-connected route
+        // wins over the default route), so "the active network's address" is not
+        // the address the peer can talk to.
+        if (cfgServer.isNotEmpty()) {
+            LocalSubnet.bestFor(cfgServer, LocalSubnet.ourNets())?.let {
+                Log.i(TAG, "Local IP chosen by the server route: $it")
+                return it
+            }
+        }
+
         // Ask for the address of the network that actually carries our
         // traffic.  Enumerating interfaces and taking the first non-loopback
         // IPv4 could hand back the cellular rmnet address while SIP was
@@ -1747,10 +1886,21 @@ class GatewayService : Service() {
     companion object {
         private const val TAG = "GatewayService"
         private const val LOG_BUFFER_SIZE = 200
-        /** Ring buffer of recent log messages — survives activity pause/resume. */
+        /**
+         * Stamp for the on-screen log.
+         *
+         * A DateTimeFormatter, not a SimpleDateFormat: the log is written from
+         * the SIP receive thread, the audio threads, the flush thread and the
+         * telephony callbacks at once, and SimpleDateFormat is not thread-safe —
+         * concurrent `format` calls share one Calendar, which shows up as wrong
+         * times or an ArrayIndexOutOfBoundsException inside the formatter.  The
+         * one place that logs on every call had no business being that fragile.
+         */
         private val bufferTimeFormat =
-            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+            java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss", java.util.Locale.US)
+                .withZone(java.time.ZoneId.systemDefault())
 
+        /** Ring buffer of recent log messages — survives activity pause/resume. */
         val logBuffer = mutableListOf<String>()
 
         /** Drain buffered logs.  Returns all messages and clears the buffer. */
@@ -1806,12 +1956,19 @@ class GatewayService : Service() {
         /** How long to wait before retrying a message the server did not take. */
         private const val SMS_RETRY_MS = 30_000L
 
+        /** How many times one message holds the queue behind it before the rest
+         *  are sent ahead of it.  Two and a half minutes of in-order patience;
+         *  past that the failure belongs to the message, not to the link. */
+        private const val SKIP_AFTER_ATTEMPTS = 5
+
         /** X-SMS-Received: ISO 8601 UTC, so the server does not have to guess
-         *  at the gateway's local time zone. */
+         *  at the gateway's local time zone.  A DateTimeFormatter because it is
+         *  used from the flush thread and the SIP receive thread at the same
+         *  time, and SimpleDateFormat is not safe to share between them. */
         private val smsTimeFormat =
-            java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).apply {
-                timeZone = java.util.TimeZone.getTimeZone("UTC")
-            }
+            java.time.format.DateTimeFormatter
+                .ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US)
+                .withZone(java.time.ZoneOffset.UTC)
 
         /**
          * Ask the running gateway to forward whatever SMS are queued.

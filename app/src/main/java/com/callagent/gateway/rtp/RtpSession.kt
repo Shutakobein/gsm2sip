@@ -10,8 +10,10 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.provider.Settings
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
+import com.callagent.gateway.CallRedirectRoute
 import com.callagent.gateway.RootCapture
 import com.callagent.gateway.RootPcmRoute
 import com.callagent.gateway.RootShell
@@ -48,7 +50,11 @@ class RtpSession(
     private val localPort: Int,
     private val remoteAddr: String,
     private val remotePort: Int,
-    private val payloadType: Int = RtpPacket.PT_PCMA
+    private val payloadType: Int = RtpPacket.PT_PCMA,
+    /** A UDP socket the bridge bound before it named this port in its SDP and is
+     *  handing over, so the port the peer was told about is already ours.  Null
+     *  means this session has to bind one itself — see [start]. */
+    private val mediaSocket: DatagramSocket? = null
 ) {
     private val running = AtomicBoolean(false)
     /** Ensures the stop callback is delivered once, including a session that
@@ -70,6 +76,33 @@ class RtpSession(
     @Volatile private var pcmPlayback: RootPcm? = null
     /** When the next playback frame is due, on the root PCM path. */
     private var nextPlayNs = 0L
+    /** The call-redirection policy carrying the call on the Exynos 990
+     *  ([DeviceProfile.callRedirect]): its sink is [capture] and its injector is
+     *  [audioTrack], so the loops do not otherwise know they are not looking at
+     *  a HAL stream.  Null on every other route.
+     *
+     *  Owned by the session: registered in initAudio(), withdrawn in the stop()
+     *  teardown thread, after the two streams it created are released.
+     *
+     *  On this device it is normally not registered here at all but handed over
+     *  already registered — see [preArmedRedirect]. */
+    @Volatile private var callRedirect: CallRedirection? = null
+
+    /** A call-redirection policy the bridge registered before it dialled the GSM
+     *  leg, waiting here for this session to adopt it.
+     *
+     *  AudioFlinger decides whether a client belongs to a policy mix at the
+     *  moment the client is created.  The two clients that carry a call on this
+     *  device are created by the modem's media path when the call starts, so a
+     *  mix registered after the call is ACTIVE matches nothing: the sink reads
+     *  digital silence and the injector has no record client to feed, which
+     *  shows up as `capRMS=0` for the whole call and `AudioTrack nonblocking
+     *  write timed out` on every frame written.  The air-proven harness
+     *  registered the policy and then dialled, so the dial does the same and the
+     *  registration arrives here.  Null means no pre-arm happened (a call this
+     *  class did not dial, or a pre-arm the framework refused), and
+     *  [startCallRedirect] falls back to registering on its own. */
+    @Volatile var preArmedRedirect: CallRedirection? = null
 
     // ── Monitor ("snoop") ────────────────────────────────────────────
     // A second track on the phone's speaker carrying both sides of the call
@@ -137,13 +170,8 @@ class RtpSession(
     @Volatile private var latchedAddr: InetAddress? = null
     @Volatile private var latchedPort: Int = 0
 
-    // Jitter buffer for received packets.  Capacity 8 (160ms) absorbs
-    // network jitter without audible gaps.  The playback loop drains
-    // excess above 5 (100ms) to bound latency — acceptable for a GSM
-    // bridge that already has 100-200ms of inherent GSM latency.
-    // Previous capacity=3 was too aggressive: any slight jitter caused
-    // packet drops and choppy audio.
-    /** Jitter buffer, in 20ms frames.
+    /** Received packets, in arrival order, until the playback loop decodes them
+     *  into the sample reservoir ([PlaybackSlip]).
      *
      *  Four frames was too tight to be workable.  Measured over a 33s call it
      *  sat at 3-4 — pinned at capacity — and logged 87 dropped frames *and* 90
@@ -151,11 +179,19 @@ class RtpSession(
      *  at that depth every burst overflows and every gap empties it.  There is
      *  no depth that both absorbs real network jitter and holds 80ms.
      *
-     *  So: room to absorb a burst, and a high-water mark to shed the excess a
-     *  frame at a time so the burst does not park permanent latency in the
-     *  queue.  Shedding one frame occasionally is the same kind of loss as the
-     *  overflow drop, but it happens at a chosen depth instead of at the
-     *  ceiling, and it is two orders of magnitude rarer. */
+     *  A shorter stats window on the S20+ shows the same shape in miniature:
+     *  `play=411 drop=6 under=3 trim=3` inside eight seconds, i.e. a glitch about
+     *  every second while the queue read `jbuf=0` — burst arrivals, and a drain
+     *  that took one packet at a time and treated a late one as a lost one.
+     *  This phone is a Wi-Fi client in power save; its driver is seen powering
+     *  the PCIe link down between traffic, so what arrives is bursts separated by
+     *  gaps, exactly the pattern that measurement shows.
+     *
+     *  Since the loop now drains this queue into a sample reservoir every cycle,
+     *  the queue is only a rendezvous between the socket thread and the playback
+     *  thread: a burst lands here and is absorbed by the reservoir's elasticity,
+     *  not by the queue's depth.  The capacity stays as the socket thread's
+     *  backstop for the case where the playback thread is stalled. */
     private val jitterBuffer = ArrayBlockingQueue<ByteArray>(JITTER_CAPACITY)
 
     // RTP inactivity tracking
@@ -169,17 +205,111 @@ class RtpSession(
     @Volatile var captureRms = 0; private set
     @Volatile var playbackRms = 0; private set
     @Volatile var rawCaptureRms = 0; private set  // Before echo gate — 0 means source is silent
-    /** Frames discarded because the jitter buffer was already full — the far
+    /** How many playback frames since the last stats line were above
+     *  [LOUD_FRAME_FLOOR], and the loudest of them.
+     *
+     *  A duration witness, not a level judgement.  `playRMS` is the level of the
+     *  single most recent frame, so on build 461 a press that the host tool had
+     *  (wrongly) kept emitting for the whole call looked identical to one that
+     *  lasted the requested 200 ms: both read one line at press level.  The count
+     *  times the frame length is what the handset was actually being asked to
+     *  speak, and it is what the AudioFlinger power plateau has to agree with. */
+    @Volatile private var windowLoudFrames = 0L
+    @Volatile private var windowMaxRms = 0
+    /** Frames discarded because the packet queue was already full — the far
      *  end is arriving faster than playback drains it, or in bursts. */
     @Volatile private var rxDropped = 0L
-    /** Frames of silence written because the jitter buffer was empty — the
-     *  audible gaps, i.e. late or lost packets from the far end. */
+    /** Frames that contained invented silence because the reservoir had run dry,
+     *  including the frames written while it refills afterwards — the audible
+     *  gaps, i.e. late or lost packets from the far end.
+     *
+     *  Counted per frame, not per sample: what matters to the listener is that a
+     *  frame went missing, and one is now as short as the slip can make it. */
     @Volatile private var underruns = 0L
-    /** Frames shed at the high-water mark to keep the queue from parking
-     *  latency after a burst. */
+    /** Frames' worth of samples cut out at the latency ceiling to keep a burst
+     *  from parking its latency in the queue.  [PlaybackSlip.dropTo] ramps the
+     *  seam; the old code deleted a whole packet at a hard discontinuity. */
     @Volatile private var trimmedFrames = 0L
+    /** The current call's sample reservoir, for the stats line: with the packet
+     *  queue emptied into it every cycle, this is where the buffered time now
+     *  lives.  Written by the playback thread, read by the stats thread. */
+    @Volatile private var playbackReservoir: PlaybackSlip? = null
     @Volatile var audioSourceName = "none"; private set
     @Volatile private var playbackUsageName = "MEDIA"
+
+    /**
+     * The RTP timeline gate in front of [jitterBuffer] — see [RtpSequencer].
+     *
+     * It is what stops a duplicated or late packet from being played a second
+     * time and puts reordered packets back in order.  Before it, an audio packet
+     * was defined by when it turned up rather than by where it belongs, and a
+     * Wi-Fi path that delivers bursts with holes in them (see [jitterBuffer])
+     * therefore made the far end hear its own words again: the "robotic audio
+     * repetition" reported from the field on 2026-11-06.
+     *
+     * Off with `settings put global callagent_rtp_gate 0`, so a real call can be
+     * run both ways against the same network path.
+     *
+     * The clock is the one the SDP negotiated — [wideband] is a getter over
+     * `payloadType`, a constructor property, so it is already valid here.
+     */
+    private val rtpGate = RtpSequencer(clockRate = if (wideband) 16000 else 8000)
+    private val gateOn = globalFlag(SETTING_RTP_GATE, 1) != 0
+
+    /** Whether the sample-accurate slip ([PlaybackSlip.stepFor]) is allowed to
+     *  read at a fractional rate, or the reservoir is drained at exactly 1:1 and
+     *  only the ceiling ever removes time.
+     *
+     *  Worth switching on a call: the slip resamples by at most [PlaybackSlip.MAX_SLIP]
+     *  (0.6 %, an order of magnitude too small to be heard as repetition), while
+     *  the reservoir and its prefill stay in place either way.  That is what makes
+     *  an on-air A/B able to *exclude* it rather than leave it argued about. */
+    private val slipOn = globalFlag(SETTING_PLAYBACK_SLIP, 1) != 0
+
+    /** How the playback loop feeds its `AudioTrack`.  This is the knob that
+     *  decides what happens to the part of a frame the track will not take:
+     *
+     *  - unset, or `-2` — follow the route this call took: [PlaybackWriter] with
+     *    [PlaybackWriter.DEFAULT_QUEUE_FRAMES] of room on the injector mix
+     *    (`callagent_uplink_via=0`, the one route measured refusing writes), and
+     *    [writePlaybackFrame] exactly as shipped on the acoustic routes (via 1 and
+     *    2), where the same loop ran 22.6 s of a call with not one refused byte;
+     *  - `0` to `10` — [PlaybackWriter] with that many frames of room.  `0` still
+     *    holds the 20 ms cycle but a refusal discards, which is build 470's
+     *    contract with the loss counted instead of only warned about;
+     *  - `-1` — [PlaybackWriter] out of it entirely on any route, so the loop runs
+     *    the write [writePlaybackFrame] as shipped.
+     *
+     *  The default follows the route rather than being one number for every call
+     *  because the two routes have opposite evidence: one is known to lose 4.83 s
+     *  of a 22.6 s call and the other is the configuration the gateway has shipped
+     *  and relied on.  An acoustic call with no setting written therefore runs
+     *  byte-for-byte what build 470 ran, and any of the three modes can still be
+     *  forced for one call with `settings put global callagent_play_stage`.
+     *
+     *  All of it is reachable from one `settings put` because this is the mechanism
+     *  that discarded 4.83 s of one agent's speech on the injected route on
+     *  2026-11-07 (`gateway-test/out/miciso-try-via0-20261107-063700`, 473 lines of
+     *  `AudioTrack nonblocking write timed out`), and the question of how much of
+     *  that was ours has to be answerable on a single call rather than argued about
+     *  afterwards.  See [PlaybackWriter] for what the two field measurements were,
+     *  and `PlaybackWriterTest` for the harness that reproduces them offline. */
+    private val playStage: Int =
+        globalFlag(SETTING_PLAY_STAGE, PLAY_STAGE_FOLLOW_ROUTE).let { stage ->
+            if (stage != PLAY_STAGE_FOLLOW_ROUTE) stage
+            else if (globalFlag(CallRedirection.UPLINK_SETTING, 0) == 0)
+                PlaybackWriter.DEFAULT_QUEUE_FRAMES
+            else -1
+        }.coerceAtMost(PlaybackWriter.MAX_QUEUE_FRAMES)
+
+    /** The staged writer for this call's track: null while build 470's own write
+     *  path is selected ([playStage] is -1), or when the session plays to the root
+     *  PCM pipe instead of a track.  Written on the playback thread, read by the
+     *  stats thread for its counters. */
+    private var playWriter: PlaybackWriter? = null
+
+    /** Where [playbackConsumed] last read the track's own read cursor to. */
+    private var playedFramesAtLastReport = -1L
 
     // Capture and playback rates may differ.  VOICE_CALL on MSM8930
     // only initializes at 8 kHz; G.722 decoding outputs 16 kHz PCM.
@@ -230,21 +360,56 @@ class RtpSession(
         Log.i(TAG, "Starting RTP session: local=$localPort remote=$remoteAddr:$remotePort pt=$payloadType")
 
         try {
-            socket = DatagramSocket(null).apply {
+            val held = mediaSocket
+            val sock = if (held != null) {
+                // The bridge bound this port before it put it into the SDP and is
+                // handing it over.  The binding is not redone — that is the whole
+                // point: between the SDP going out and this moment the peer may
+                // already be sending, and a port that is only probed and closed
+                // (the old allocateRtpPort) is listening by nobody during that
+                // window.  Only the options this class needs are set here.
+                held.apply {
+                    soTimeout = 100
+                    receiveBufferSize = 262144
+                }
+            } else DatagramSocket(null).apply {
                 reuseAddress = true
                 bind(InetSocketAddress(localPort))
                 soTimeout = 100
                 receiveBufferSize = 262144
             }
+            socket = sock
+            // Ask the kernel what it has rather than repeating what we asked for.
+            // Every unexplained air test in this project turned on these two
+            // numbers disagreeing: on 2026-11-06 the SDP named 192.168.0.6:33642
+            // and the host measured our RTP arriving from :44131, while the log
+            // said only "local=33642" — the number we asked for, not the number
+            // in the packet.
+            if (sock.localPort != localPort) {
+                Log.e(TAG, "RTP socket is on port ${sock.localPort}, NOT the $localPort named in our SDP — the peer will send to a port nothing holds")
+            } else {
+                Log.i(TAG, "RTP socket ready: port ${sock.localPort} bound on ${sock.localSocketAddress}")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind RTP socket on port $localPort: ${e.message}")
+            // A socket handed over but never adopted is ours to close, or it keeps
+            // the port out of reach for the next call.
+            try { mediaSocket?.close() } catch (_: Exception) {}
             running.set(false)
             listener?.onRtpError("Socket bind failed: ${e.message}")
             return
         }
 
         if (!initAudio()) {
+            // Close it here: stop() takes the early return for a session that
+            // never reached the running state, so a socket left bound here holds
+            // the port the SDP just named — and with SO_REUSEADDR the next
+            // call's port probe calls that port free.  One dead session then
+            // steals the next call's inbound RTP: rx=0, silent far end.
+            try { socket?.close() } catch (_: Exception) {}
+            socket = null
             running.set(false)
+            Log.e(TAG, "RTP audio never came up — socket on port $localPort released")
             return
         }
 
@@ -331,6 +496,22 @@ class RtpSession(
         playbackRate = when (payloadType) {
             RtpPacket.PT_PCMA, RtpPacket.PT_PCMU -> 8000
             else -> 16000  // G.722
+        }
+
+        // Above the HAL rather than around it: where the profile says so, the
+        // call's own AudioFlinger clients are taken over by an audio policy, and
+        // that policy is what hands us both streams — so it has to run before
+        // any stream of ours exists.  See DeviceProfile.callRedirect.
+        profile.callRedirect?.let { route ->
+            if (startCallRedirect(route)) return true
+            // Deliberately no fallback to the code below.  On the firmware this
+            // route was built for, every AudioRecord telephony source reads
+            // silence and no playback track reaches the modem; opening a
+            // microphone and a speaker track instead would keep the session
+            // alive looking healthy while carrying something else entirely.
+            Log.e(TAG, "Call redirection unavailable — no audio route for this call")
+            listener?.onRtpError("Call redirection failed (see logcat: CallRedirection)")
+            return false
         }
 
         profile.rootPcm?.let { route ->
@@ -491,7 +672,8 @@ class RtpSession(
         // Minimum buffer for lowest latency.  incall_music injects
         // AudioTrack output digitally into the modem uplink — there is no
         // acoustic speaker→mic path, so deep-buffer headroom is unnecessary.
-        // Writing silence when the jitter buffer is empty prevents underruns.
+        // Writing a frame every cycle, with the reservoir holding
+        // JITTER_TARGET_FRAMES of headroom behind it, is what prevents underruns.
         val playChannelMask = if (profile.playbackStereo)
             AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
         playbackChannels = if (profile.playbackStereo) 2 else 1
@@ -656,6 +838,122 @@ class RtpSession(
     }
 
     /**
+     * Open the call through the framework's call-redirection policy: register the
+     * two mixes, then take the sink and the source they create as this session's
+     * capture and playback.  See [DeviceProfile.callRedirect] and
+     * [CallRedirection].
+     *
+     * Returns false, having registered nothing, if any step is refused — the
+     * permission gate, the framework's own format checks, or a call whose media
+     * clients are not there to be taken over.
+     */
+    private fun startCallRedirect(route: CallRedirectRoute): Boolean {
+        // A pre-armed policy is taken over here, and ownership moves to this
+        // session: from this point the stop() thread's closeCallRedirect() is the
+        // only thing that withdraws it, whatever happens below.
+        val pre = preArmedRedirect
+        preArmedRedirect = null
+        // The mix, the sink and the injector all have one geometry, and the
+        // codec has to agree with it: a G.722 session decodes to 16 kHz and
+        // would be written 40 ms at a time into an 8 kHz stream.  The profile
+        // pins G.711 for exactly this reason (GatewayService), so reaching here
+        // with a mismatch means the peer answered with something else.
+        if (playbackRate != route.mixRate) {
+            val why = "codec rate $playbackRate Hz, policy mix ${route.mixRate} Hz"
+            Log.e(TAG, "Call redirect rate mismatch: $why")
+            listener?.onRtpStats("Call redirect refused: $why (this device needs G.711)")
+            // The pre-arm registered mixes for a call that cannot be bridged.
+            // Withdrawing them here is what keeps the next call clean.
+            pre?.close()
+            return false
+        }
+        val gw = if (pre != null) {
+            // Registered, sinked and sourced before the dial, so the call's own
+            // modem clients were created inside these mixes.
+            Log.i(TAG, "Call redirect adopted: policy was registered before the dial")
+            pre
+        } else {
+            if (!CallRedirection.hiddenApiOpen(context)) {
+                Log.w(TAG, "Call redirect: hidden-API enforcement is on for this process; " +
+                    "the audiopolicy classes are not reachable without the module's " +
+                    "'settings put global hidden_api_policy 0'")
+            }
+            CallRedirection.probe()
+            Log.w(TAG, "Call redirect: no pre-armed policy for this call, registering it now — " +
+                "the call's own clients already exist and may not be matched into the mixes")
+            val opened = CallRedirection.open(context, route.mixRate, route.wantInjector) ?: return false
+            if (!opened.start(route.mixRate)) {
+                opened.close()
+                return false
+            }
+            opened
+        }
+        val sink = gw.sink
+        captureRate = sink.sampleRate
+        audioSessionId = sink.audioSessionId
+        audioSourceName = "POLICY-DL@${captureRate / 1000}k"
+        capture = AudioRecordSource(sink, audioSourceName)
+        // No AudioRecord source id: the silence detector's blacklist is for the
+        // HAL sources, and this one is not interchangeable with them.
+        currentSourceId = -1
+
+        if (gw.hasInjector) {
+            audioTrack = gw.injector
+            playbackChannels = 1
+            playbackUsageName = "${gw.uplinkRoute}@${gw.injector.sampleRate / 1000}k"
+        } else {
+            // A downlink-only policy: the agent would have nowhere to be written,
+            // and a one-way bridge is not what this device is for.
+            Log.e(TAG, "Call redirect registered but no injector: caller audible, agent cannot speak")
+            listener?.onRtpStats("Call redirect: injector refused, caller-only route")
+        }
+
+        // The witness that has always counted on this device: what the framework
+        // itself says about the mixes, not what any level meter reported.
+        val state = gw.registeredMixes()
+        Log.i(TAG, "Call redirect up: cap=$captureRate sinkRate=${sink.sampleRate} " +
+            "injector=${gw.hasInjector} uplink=${gw.uplinkRoute} " +
+            "session=$audioSessionId mixes=[$state]")
+        listener?.onRtpStats("Call redirected above AudioFlinger at ${route.mixRate} Hz: mixes=[$state]")
+        callRedirect = gw
+        // Diagnostic, off unless `callagent_uplink_witness=1`: listen to what a
+        // record client on the call's own capture preset is handed during this
+        // call.  AudioFlinger's history for that path is taken before the echo
+        // canceller and the noise suppresser registered on it, so the dump shows
+        // the tone at the microphone and says nothing about what reaches the modem.
+        // This does.
+        gw.startUplinkWitness(context, captureRate)
+        // The session may have been stopped while the policy was being opened:
+        // stop() saw no streams to release, so undo the registration here.
+        if (!running.get()) {
+            closeCallRedirect()
+            return false
+        }
+        return true
+    }
+
+    /** Withdraw the policy.  Called from the stop() teardown thread, once the
+     *  worker threads have left their read/write and the sink and injector they
+     *  used are released: un-registering a mix while one of its streams is live
+     *  is how the next call inherits a half-dead route. */
+    private fun closeCallRedirect() {
+        val gw = callRedirect ?: return
+        callRedirect = null
+        gw.close()
+        Log.i(TAG, "Call redirect closed")
+    }
+
+    /** Withdraws a pre-armed policy that was never adopted.  An adopted one is
+     *  owned by [callRedirect] and closed by [closeCallRedirect], so the two
+     *  never touch the same registration. */
+    private fun closePreArmedRedirect() {
+        val pre = preArmedRedirect ?: return
+        preArmedRedirect = null
+        pre.close()
+        Log.i(TAG, "Pre-armed call redirect withdrawn without being adopted")
+    }
+
+    /**
      * Initialize AudioRecord with retries, then run the capture loop.
      *
      * On cold boot, AudioFlinger refuses to create record tracks for
@@ -672,6 +970,24 @@ class RtpSession(
         pcmCapture?.let { rootCaptureLoop(it); return }
 
         val defaultRemoteInet = InetAddress.getByName(remoteAddr)
+
+        // A call taken over by the audio policy has exactly one capture source:
+        // that policy's sink.  No fallback list and no silent-source search here,
+        // deliberately — see DeviceProfile.callRedirect.  On the firmware this
+        // route exists for, every AudioRecord source reads silence, so the search
+        // would end at the microphone; a call carried on a microphone is a
+        // different route being measured, not the same one degraded.  All that is
+        // left when the sink goes away mid-call is what the exhausted-source path
+        // below already does for other devices: keep the RTP leg alive so the
+        // agent is still heard.
+        profile.callRedirect?.let {
+            if (capture != null && captureLoop()) return
+            if (!running.get()) return
+            Log.e(TAG, "Call-redirection sink ended — capture off, RTP kept alive for playback")
+            listener?.onRtpStats("Call-redirection sink ended (see logcat: CallRedirection)")
+            while (running.get()) sendSilencePackets(5000, defaultRemoteInet)
+            return
+        }
 
         // Root PCM capture first where the profile asks for it — see
         // DeviceProfile.rootCapture.  tinycap can exit mid-call (the HAL
@@ -972,6 +1288,10 @@ class RtpSession(
         restoreHalCallParams()
 
         if (!wasRunning) {
+            // A session that died during startup has a bound socket and no loop
+            // threads; nothing below this return would ever close it.
+            try { socket?.close() } catch (_: Exception) {}
+            socket = null
             notifyRtpStopped()
             return
         }
@@ -996,6 +1316,9 @@ class RtpSession(
         audioTrack = null
         socket = null
         jitterBuffer.clear()
+        // The timeline goes with the buffer: if this session is ever reused, its
+        // gate must not carry the previous call's frontier into the next one.
+        rtpGate.reset()
 
         Thread({
             val me = Thread.currentThread()
@@ -1006,6 +1329,15 @@ class RtpSession(
                 if (it.isAlive) Log.w(TAG, "${it.name} still running after ${JOIN_TIMEOUT_MS}ms")
             }
             try { stopRootPcm() } catch (e: Exception) { Log.w(TAG, "Root PCM stop: ${e.message}") }
+            // A policy that was handed over for the dial but never adopted — the
+            // session was stopped before its audio came up — still has to be
+            // withdrawn, or the mixes sit registered with nothing using them.
+            try { closePreArmedRedirect() } catch (e: Exception) { Log.w(TAG, "Pre-armed redirect stop: ${e.message}") }
+            // Last, after the sink and injector the policy created are released:
+            // a mix withdrawn while one of its streams is still live is how the
+            // next call registers on top of a route the framework is halfway
+            // through tearing down.
+            try { closeCallRedirect() } catch (e: Exception) { Log.w(TAG, "Call redirect stop: ${e.message}") }
             cap?.let { try { it.release() } catch (_: Exception) {} }
             trk?.let {
                 try { it.stop() } catch (_: Exception) {}
@@ -1442,7 +1774,14 @@ class RtpSession(
                 rxPacketCount++
                 // Log first packet details for debugging
                 if (rxPacketCount == 1L) {
-                    Log.i(TAG, "First RX: pt=${rtp.payloadType} len=${rtp.payload.size}")
+                    // Names the port this packet actually arrived on.  Together
+                    // with the "RTP socket ready" line at start() and the peer's
+                    // own measurement of where our RTP came from, it says which
+                    // of the two directions is not using the port the SDP agreed
+                    // to — the failure that showed up as a one-way call.
+                    Log.i(TAG, "First RX: pt=${rtp.payloadType} len=${rtp.payload.size} " +
+                            "on our port ${socket?.localPort} (SDP said $localPort) " +
+                            "from ${packet.address.hostAddress}:${packet.port}")
                 }
                 // Telephone-event first: a DTMF packet must never reach the
                 // jitter buffer, and it must not be dropped either — that is
@@ -1453,10 +1792,11 @@ class RtpSession(
                     continue
                 }
                 if (rtp.payloadType == payloadType || rtp.payloadType == RtpPacket.PT_PCMA || rtp.payloadType == RtpPacket.PT_G722) {
-                    if (!jitterBuffer.offer(rtp.payload)) {
-                        jitterBuffer.poll() // drop oldest
-                        jitterBuffer.offer(rtp.payload)
-                        rxDropped++
+                    if (gateOn) {
+                        rtpGate.accept(rtp) { offerPlayback(it.payload) }
+                        reportGateOnce()
+                    } else {
+                        offerPlayback(rtp.payload)
                     }
                 }
             } catch (_: SocketTimeoutException) {
@@ -1465,6 +1805,33 @@ class RtpSession(
                 if (running.get()) Log.e(TAG, "Receive error: ${e.message}")
             }
         }
+    }
+
+    /** Puts one audio packet's payload where the playback loop picks it up.
+     *  Overflow drops the oldest, which is the only thing available to a socket
+     *  thread that must never block: SIP shares this thread. */
+    private fun offerPlayback(payload: ByteArray) {
+        if (!jitterBuffer.offer(payload)) {
+            jitterBuffer.poll() // drop oldest
+            jitterBuffer.offer(payload)
+            rxDropped++
+        }
+    }
+
+    /** Says out loud, the first time it happens and every 50 packets after, that
+     *  the path really is handing this call repeated or expired audio.  Without
+     *  this line the only sign of it is someone on the GSM leg hearing themselves
+     *  twice, which is not something anybody can quote back to a log.
+     *
+     *  The counters are read here without the gate's lock: they are diagnostics,
+     *  and a stale read at worst delays the report by one packet. */
+    private var gateReported = -1L
+    private fun reportGateOnce() {
+        val seen = rtpGate.duplicates + rtpGate.stale
+        if (seen == 0L || seen == gateReported) return
+        if (gateReported >= 0 && seen - gateReported < 50) return
+        gateReported = seen
+        Log.w(TAG, "Replay guard: ${rtpGate.stats()}")
     }
 
     // ── RTP inactivity timeout ─────────────────────────
@@ -1502,13 +1869,40 @@ class RtpSession(
                 // bridge setup and never change during a call, so reading them
                 // fifty times over a call told us nothing new.
                 val stats = "tx=$txPacketCount rx=$rxPacketCount play=$playbackFrames " +
-                        "capRMS=$captureRms rawCapRMS=$rawCaptureRms playRMS=$playbackRms src=$audioSourceName " +
+                        "capRMS=$captureRms rawCapRMS=$rawCaptureRms playRMS=$playbackRms " +
+                        "playWinLoud=$windowLoudFrames(${windowLoudFrames * 20}ms) playWinMax=$windowMaxRms " +
+                        "src=$audioSourceName " +
                         "rate=${captureRate}/${playbackRate} jbuf=${jitterBuffer.size} " +
+                        "res=${playbackReservoir?.let { it.depth / (playbackRate / 50) } ?: 0} " +
                         "drop=$rxDropped under=$underruns trim=$trimmedFrames dtmf=$rxDtmfPackets " +
-                        "gates:echo=$echoGatedFrames noise=$noiseGatedFrames fwd=$forwardedFrames dt=$doubleTalkFrames" +
+                        "gates:echo=$echoGatedFrames noise=$noiseGatedFrames fwd=$forwardedFrames dt=$doubleTalkFrames " +
+                        (if (gateOn) rtpGate.stats() else "gate=off") +
+                        " slip=" + (if (slipOn) "on" else "off") +
+                        // The playback writer's counters: what the sink took, what
+                        // is still waiting for it, what was given up, and how many
+                        // cycles the sink refused.  Read from volatile fields off the
+                        // audio thread, so at worst a cycle stale; nothing here
+                        // queries the framework, which is what the note above this
+                        // block is about.
+                        //
+                        // `stage=` names the mode the call was actually running in,
+                        // including when no writer was built (`wr=build470` for
+                        // stage -1, `wr=none` if the loop never got as far as a
+                        // track).  Without it, a stats line cannot say which half of
+                        // an A/B it came from.
+                        (playWriter?.let { " stage=$playStage " + it.summary() }
+                            ?: if (playStage < 0) " stage=-1 wr=build470"
+                               else " stage=$playStage wr=none") +
+                        // ...and what the output did with it: rendered frames
+                        // against handed frames, so the audio still inside the
+                        // track's buffer shows up as a number instead of as
+                        // someone on the far end waiting for a word.
+                        playbackConsumed() +
                         getCpuStats()
                 Log.i(TAG, "RTP: $stats")
                 listener?.onRtpStats(stats)
+                windowLoudFrames = 0
+                windowMaxRms = 0
 
                 val elapsed = System.currentTimeMillis() - lastRtpReceivedTime
                 if (elapsed > RTP_TIMEOUT_MS) {
@@ -1621,11 +2015,58 @@ class RtpSession(
     }
 
     /** One playback frame to wherever this session plays: the AudioTrack, or
-     *  the root PCM pipe. */
+     *  the root PCM pipe.
+     *
+     *  The root pipe does its own pacing ([writeRootPlaybackFrame]) and never
+     *  refuses anything, so it is written directly.  The track goes through
+     *  [PlaybackWriter] unless `callagent_play_stage=-1` asked for build 470's
+     *  write path. */
     private fun writePlaybackOut(track: AudioTrack?, data: ByteArray) {
         val root = pcmPlayback
-        if (root != null) writeRootPlaybackFrame(root, data)
-        else if (track != null) writePlaybackFrame(track, data)
+        if (root != null) {
+            writeRootPlaybackFrame(root, data)
+            return
+        }
+        if (track == null) return
+        val writer = playWriter
+        if (writer != null) writer.write(data) else writePlaybackFrame(track, data)
+    }
+
+    /**
+     * What the output has actually rendered, in frames since this call's track was
+     * created, and what the bridge has handed it: the gap between the two is audio
+     * sitting in the track's own buffer, which is delay the far end feels but no
+     * counter in the app could see before now.
+     *
+     * Read on the stats thread, never the audio one.  `playbackHeadPosition` is the
+     * position the framework has rendered to, kept in shared memory and advancing
+     * monotonically; it is not reset except by `flush()`, and nothing here calls
+     * `flush()`.  It is an Int, so it is masked to unsigned and the wrap is
+     * reported rather than hidden: at 8 kHz it comes round every six days, which no
+     * call reaches, but a session being replaced does not get a wrong number either.
+     *
+     * This is the half of the injected-uplink question that offline tests cannot
+     * answer.  `wr:out=` in the same line counts what the route took from us; only
+     * the route knows what it then played, and on 2026-11-07 the route's own
+     * counters contradicted each other — `Frames written: 145 408` against
+     * `stop(93): called with 182 536 frames delivered` for the same track.
+     */
+    private fun playbackConsumed(): String {
+        val track = audioTrack ?: return ""
+        val writer = playWriter ?: return ""
+        return try {
+            val played = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            val handed = writer.accepted / (playbackChannels * 2L)
+            val since = if (playedFramesAtLastReport < 0L) 0L
+            else played - playedFramesAtLastReport
+            playedFramesAtLastReport = played
+            val held = handed - played
+            " played=${played}f(+$since) handed=${handed}f held=${held}f/${held * 1000L / playbackRate}ms"
+        } catch (t: Throwable) {
+            // A framework call that throws must never take a live call down; the
+            // absence of the number is itself the information.
+            " played=n/a(${t.javaClass.simpleName})"
+        }
     }
 
     /**
@@ -1912,12 +2353,44 @@ class RtpSession(
         if (track == null && pcmPlayback == null) return
 
         if (track != null) {
-            // No prefill — the silence-frame loop below feeds the AudioTrack
-            // continuously, preventing underruns.  Removing the old 20ms prefill
-            // saves that much initial latency.
+            // Nothing is written to the track before the loop starts: the loop
+            // feeds it continuously from its first cycle, which is what keeps an
+            // underrun (and the BUFFER TIMEOUT and restart cycle that used to
+            // follow one) from ever happening.  What the loop does buffer is the
+            // reservoir's own target depth, and that is deliberate: see
+            // JITTER_TARGET_FRAMES.
             track.play()
-            Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName deepBuffer=true) " +
-                "routedTo=${track.routedDevice?.type}")
+            // A track created by an audio policy (see [CallRedirection]) is not
+            // routed to an output device at all: its output is a mix.  The
+            // framework answers that question with null, or declines it, so the
+            // route is reported without letting a diagnostic take the call down.
+            val routed = try { "routedTo=${track.routedDevice?.type}" } catch (_: Throwable) { "routedTo=n/a" }
+            Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName " +
+                    "deepBuffer=true reservoir=${JITTER_TARGET_FRAMES * 20}ms " +
+                    "slip=${if (slipOn) "on" else "off"} gate=${if (gateOn) "on" else "off"} " +
+                    "stage=$playStage) $routed")
+
+            // From here the track is fed by [PlaybackWriter], not by a bare
+            // AudioTrack.write(): it owns the cycle's clock and keeps whatever the
+            // track will not take, instead of returning a 30 ms deadline as "no
+            // opinion" and letting the rest of the frame go.  `stage=0` keeps the
+            // pacing and drops like build 470 did; `stage=-1` means the block
+            // above logged the truth and [writePlaybackFrame] still does the work.
+            if (playStage >= 0) {
+                playedFramesAtLastReport = -1L
+                playWriter = PlaybackWriter(
+                    sink = PlaybackWriter.Sink { bytes, off, len ->
+                        track.write(bytes, off, len, AudioTrack.WRITE_NON_BLOCKING)
+                    },
+                    // One 20 ms frame as it is actually written: mono samples,
+                    // doubled again when the track is stereo — the same size as
+                    // [silenceFrame] below, which is what the loop writes while the
+                    // reservoir is still filling.
+                    frameBytes = playbackRate / 50 * 2 * playbackChannels,
+                    queueFrames = playStage,
+                    alive = { running.get() },
+                )
+            }
 
             // Set incall_music_enabled=true AFTER AudioTrack.play(): the Qualcomm
             // HAL on MSM8930 starts the incall-music usecase only once there is an
@@ -1938,9 +2411,19 @@ class RtpSession(
             enableIncallMusicViaMixer()
         }
 
-        // Silence frame for when jitter buffer is empty — prevents underruns
-        // that cause BUFFER TIMEOUT and AudioTrack disable/restart cycles.
-        val silenceFrame = ByteArray(playbackRate * 2 * playbackChannels / 50) // 20ms
+        // 20ms of digital silence.  Written only while the reservoir is being
+        // filled, so the AudioTrack never runs dry — a dry track is what used to
+        // end in BUFFER TIMEOUT and a disable/restart cycle.
+        val silenceFrame = ByteArray(playbackRate * 2 * playbackChannels / 50)
+
+        // The sample reservoir: this is where received audio is buffered now,
+        // rather than as packets in [jitterBuffer].  [PlaybackSlip] explains why
+        // the packet had to stop being the unit of time; the loop below is the
+        // part that uses it.
+        val frameSamples = playbackRate / 50
+        val slip = PlaybackSlip(frameSamples)
+        playbackReservoir = slip
+        val frame = ByteArray(frameSamples * 2)
 
         // Track silence→speech transitions for fade-in.
         // Modem DSP AGC/DTX settles during silence; abrupt speech onset
@@ -1948,60 +2431,107 @@ class RtpSession(
         // A short fade-in smooths the transition.
         var wasPlayingSilence = true
 
+        // Whether the reservoir has reached [JITTER_TARGET_FRAMES] yet.  It has
+        // to be full before it can absorb anything.
+        var primed = false
+
         while (running.get()) {
             try {
-                // Drain excess packets to bound latency.  When network
-                // jitter causes burst arrivals, the buffer can accumulate.
-                // Keep at most 5 (100ms) — enough headroom to absorb
-                // jitter without audible gaps.  100ms is still well within
-                // the GSM bridge's inherent latency budget.
-
-                // Longer than the 20ms frame period, deliberately: at 18ms a
-                // packet that was merely a little late was treated as missing
-                // and a silence frame went to the caller instead.
-                val encoded = jitterBuffer.poll(JITTER_POLL_MS, TimeUnit.MILLISECONDS)
-                if (encoded == null) {
-                    // Write silence to keep AudioTrack fed and prevent underruns.
-                    writePlaybackOut(track, silenceFrame)
-                    underruns++
-                    playbackRms = 0
-                    currentPlaybackActive = false
-                    wasPlayingSilence = true
-                    continue
-                }
-
-                // Shed one frame if a burst has left the queue deep.  Without
-                // this the depth reached after a burst is simply kept, and the
-                // caller hears every later word that much later.
-                if (jitterBuffer.size > JITTER_HIGH_WATER) {
-                    jitterBuffer.poll()
-                    trimmedFrames++
-                }
-
-                // Decode based on codec.  G.722 outputs 16 kHz natively;
-                // PCMA always decodes to 8 kHz (playbackRate==8000).
-                val pcm = when (payloadType) {
-                    RtpPacket.PT_G722 -> g722Decoder.decodeToBytes(encoded)
-                    RtpPacket.PT_PCMA -> {
-                        if (playbackRate == 8000) PcmaCodec.decode8k(encoded)
-                        else PcmaCodec.decode(encoded)
+                // 1. Everything that has arrived is decoded into the reservoir,
+                //    in arrival order.  Decoding stays on this thread: the socket
+                //    thread is shared with SIP.
+                //
+                //    The gate is pumped first: its patience for a missing packet
+                //    is measured on this thread's clock, because a held packet has
+                //    to reach the reservoir when the far end stalls, not only when
+                //    the next packet turns up.
+                if (gateOn) rtpGate.pump { offerPlayback(it.payload) }
+                while (true) {
+                    val encoded = jitterBuffer.poll() ?: break
+                    // Decode based on codec.  G.722 outputs 16 kHz natively;
+                    // PCMA always decodes to 8 kHz (playbackRate==8000).
+                    val pcm = when (payloadType) {
+                        RtpPacket.PT_G722 -> g722Decoder.decodeToBytes(encoded)
+                        RtpPacket.PT_PCMA -> {
+                            if (playbackRate == 8000) PcmaCodec.decode8k(encoded)
+                            else PcmaCodec.decode(encoded)
+                        }
+                        else -> g722Decoder.decodeToBytes(encoded)
                     }
-                    else -> g722Decoder.decodeToBytes(encoded)
+                    slip.appendLe(pcm)
+                }
+
+                // How much time is buffered, counting what is still queued as
+                // packets as well as what is already samples.
+                var depthFrames = (slip.depth + jitterBuffer.size * frameSamples) / frameSamples
+
+                // 2. Latency ceiling.  The slip trims drift gently, and only
+                //    gently; a burst far beyond what it can absorb has to be cut
+                //    out or it parks its latency in the queue for the rest of the
+                //    call.  Only the excess above target goes, and [dropTo] ramps
+                //    the seam instead of leaving a hard 20ms hole with a click at
+                //    each end.  See JITTER_HIGH_WATER.
+                if (depthFrames > JITTER_HIGH_WATER) {
+                    val dropped = slip.dropTo(JITTER_TARGET_FRAMES * frameSamples)
+                    if (dropped > 0) {
+                        trimmedFrames += (dropped + frameSamples - 1) / frameSamples
+                        depthFrames = slip.depth / frameSamples
+                    }
+                }
+
+                // 3. Prefill.  Nothing is played until the reservoir holds its
+                //    target depth, and the gate closes again every time the
+                //    reservoir runs dry.  Playing straight out of the first
+                //    arrival is what made every later late packet cost a whole
+                //    frame of silence.
+                if (!primed) {
+                    if (depthFrames < JITTER_TARGET_FRAMES) {
+                        writePlaybackOut(track, silenceFrame)
+                        underruns++
+                        playbackRms = 0
+                        currentPlaybackActive = false
+                        wasPlayingSilence = true
+                        continue
+                    }
+                    primed = true
+                }
+
+                // 4. Exactly one frame out, read at the fractional rate the depth
+                //    asks for: 1.0 exactly when the reservoir is on target, and
+                //    then every sample passes through untouched.
+                //
+                //    With the slip switched off the rate is pinned at 1.0: the
+                //    reservoir, its prefill and its ceiling all still work, and only
+                //    the interpolation is taken out.  That is the A/B a real call
+                //    needs, and it is reversible with one `settings put global`.
+                val step = if (slipOn) slip.stepFor(depthFrames, JITTER_TARGET_FRAMES) else 1.0
+                val padded = slip.drainLe(step, frame)
+                if (padded > 0) {
+                    // Ran dry.  Ramp the last real samples down into the gap
+                    // rather than leaving a step where the audio stopped, count
+                    // it as the audible gap it is, and refill before playing on.
+                    applyFadeOutLe(frame, frameSamples - padded)
+                    underruns++
+                    primed = false
                 }
 
                 // Fade-in after silence: prevents modem DSP AGC spike that
                 // causes distorted/harsh beginning of each agent phrase.
                 // 5ms ramp (40 samples @ 8kHz) is enough to smooth the onset.
+                //
+                // It is applied to what is about to be written rather than to the
+                // packet it arrived in: with the reservoir in between, a phrase
+                // can start anywhere inside a frame, and the fade belongs at the
+                // seam, not at a packet boundary.
                 if (wasPlayingSilence) {
-                    if (profile.playbackFadeIn) applyFadeIn(pcm)
-                    wasPlayingSilence = false
+                    if (profile.playbackFadeIn) applyFadeIn(frame)
                 }
 
                 // Measure RMS BEFORE gain for the echo gate.  The echo gate
                 // threshold was calibrated to raw codec output levels.  If
                 // playbackGain > 1, measuring after gain would lower the
                 // effective threshold, over-suppressing caller speech.
-                val rawRms = pcmRms(pcm)
+                val rawRms = pcmRms(frame)
                 currentPlaybackActive = rawRms > echoGateThreshold
 
                 // Software gain: boost PCM before writing to AudioTrack.
@@ -2009,9 +2539,9 @@ class RtpSession(
                 // without changing STREAM_MUSIC volume (which clips at >14%).
                 val gain = playbackGain
                 if (gain != 1.0) {
-                    for (i in 0 until pcm.size / 2) {
-                        val lo = pcm[i * 2].toInt() and 0xFF
-                        val hi = pcm[i * 2 + 1].toInt()
+                    for (i in 0 until frame.size / 2) {
+                        val lo = frame[i * 2].toInt() and 0xFF
+                        val hi = frame[i * 2 + 1].toInt()
                         val sample = ((((hi shl 8) or lo) * gain).toInt())
                         // Soft-limit, not a hard clamp: a boosted peak used to
                         // be cut flat at full scale, heard as crackle on every
@@ -2020,8 +2550,8 @@ class RtpSession(
                         // changes; above it the excess is compressed smoothly
                         // towards full scale.
                         val clamped = softLimit(sample)
-                        pcm[i * 2] = (clamped and 0xFF).toByte()
-                        pcm[i * 2 + 1] = ((clamped shr 8) and 0xFF).toByte()
+                        frame[i * 2] = (clamped and 0xFF).toByte()
+                        frame[i * 2 + 1] = ((clamped shr 8) and 0xFF).toByte()
                     }
                 }
 
@@ -2029,19 +2559,62 @@ class RtpSession(
                     // Zero before both the modem and the monitor, so someone
                     // listening in hears the mute take effect rather than
                     // audio the caller is no longer getting.
-                    java.util.Arrays.fill(pcm, 0)
+                    java.util.Arrays.fill(frame, 0)
                 }
-                playbackRms = if (playbackGain > 1) pcmRms(pcm) else rawRms
-                feedMonitor(pcm)
-                playDump?.let { try { it.write(pcm) } catch (_: Exception) {} }
-                val out = if (playbackChannels == 2) monoToStereo(pcm) else pcm
+                playbackRms = if (playbackGain > 1) pcmRms(frame) else rawRms
+                if (playbackRms > PLAYBACK_WINDOW_LOUD_FLOOR) {
+                    windowLoudFrames++
+                    if (playbackRms > windowMaxRms) windowMaxRms = playbackRms
+                }
+                feedMonitor(frame)
+                playDump?.let { try { it.write(frame) } catch (_: Exception) {} }
+                val out = if (playbackChannels == 2) monoToStereo(frame) else frame
                 writePlaybackOut(track, out)
+                // A frame that ended in a gap has to be followed by a fade-in,
+                // whichever direction the seam is on.
+                wasPlayingSilence = padded > 0
                 playbackFrames++
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
                 if (running.get()) Log.e(TAG, "Playback error: ${e.message}")
             }
+        }
+        playbackReservoir = null
+        // Withdraw the writer with the loop that owns it: its counters stay
+        // readable until the next call replaces it, which is what lets the last
+        // stats line of a call still be about the call that just ended.
+        //
+        // close() first, so the frames still staged at hang-up are counted as
+        // lost rather than vanishing between the last stats line and the next
+        // call.  They are not flushed: the call is over, and waiting for a route
+        // that refused them all call would delay teardown.
+        playWriter?.close()
+        playWriter = null
+    }
+
+    /**
+     * Mirror of [applyFadeIn]: ramp the last `fadeMs` of the first [realSamples]
+     * samples down to zero.
+     *
+     * Used where the reservoir ran dry and the rest of the frame is invented
+     * silence.  Without it the frame stops at whatever amplitude it happened to
+     * be at, which is a step — one click per gap, which is what a listener hears
+     * as static.  Ramping costs [realSamples] downwards from a whole syllable's
+     * worth of 5ms and buys a seam the ear reads as a dip instead.
+     */
+    private fun applyFadeOutLe(pcm: ByteArray, realSamples: Int, fadeMs: Int = 5) {
+        val count = (playbackRate * fadeMs / 1000).coerceAtMost(realSamples)
+        if (count <= 0) return
+        val from = realSamples - count
+        for (i in 0 until count) {
+            val at = (from + i) * 2
+            val lo = pcm[at].toInt() and 0xFF
+            val hi = pcm[at + 1].toInt()
+            val sample = (hi shl 8) or lo
+            val faded = (sample.toLong() * (count - i) / count).toInt().coerceIn(-32768, 32767)
+            pcm[at] = (faded and 0xFF).toByte()
+            pcm[at + 1] = ((faded shr 8) and 0xFF).toByte()
         }
     }
 
@@ -2349,6 +2922,23 @@ class RtpSession(
             .getBoolean("audio_diag", false)
     } catch (_: Exception) { false }
 
+    /**
+     * Reads one of this gateway's own `Settings.Global` switches — the same
+     * mechanism [CallRedirection] uses for `callagent_uplink_via`, so one
+     * `settings put global` takes a mechanism out of the next call and a
+     * `settings get global` says what the last one ran with.
+     *
+     * Global rather than the app's preferences because it has to outlive an app
+     * update and a reboot, and because it is read from a shell over a USB cable.
+     * Reads need no permission; writing needs root, which is the right place for
+     * a switch that changes the call path.
+     */
+    private fun globalFlag(key: String, default: Int): Int = try {
+        Settings.Global.getInt(context.contentResolver, key, default)
+    } catch (_: Throwable) {
+        default
+    }
+
     private fun logCaptureDiagnostics(record: AudioRecord) {
         try {
             // Check CAPTURE_AUDIO_OUTPUT (system permission, not runtime)
@@ -2573,12 +3163,65 @@ class RtpSession(
          *  a turn — see [captureInitAndLoop]. */
         private const val ROOT_CAPTURE_ATTEMPTS = 3
 
-        /** Jitter buffer ceiling, in 20ms frames (240ms). */
+        /** Packet queue ceiling, in 20ms frames (240ms). */
         private const val JITTER_CAPACITY = 12
-        /** Depth above which one frame per cycle is shed (140ms). */
+        /** Reservoir depth the playback loop aims at, in 20ms frames (60ms).
+         *
+         *  This is the elasticity that absorbs a late arrival, so it has to be
+         *  sitting there before it is needed: the loop prefills to it, holds it,
+         *  and returns to it whenever the reservoir runs dry.  It is deliberately
+         *  less latency than the old design actually carried — that one ran
+         *  pinned at 140ms of queue and still glitched. */
+        private const val JITTER_TARGET_FRAMES = 3
+        /** Reservoir depth above which the excess is shed in one go, seam ramped
+         *  ([PlaybackSlip.dropTo]), instead of one whole packet at a time
+         *  (140ms).  The slip is capped at ±0.6% because more than that is heard
+         *  as pitch, so a burst far beyond it has to be cut out: keeping it would
+         *  park its latency in the queue for the rest of the call. */
         private const val JITTER_HIGH_WATER = 7
-        /** How long playback waits for a late frame before writing silence. */
-        private const val JITTER_POLL_MS = 30L
+
+        /** Registry key: `0` to bypass the RTP timeline gate ([RtpSequencer]) and
+         *  take audio packets in arrival order again — the on-air A/B for the
+         *  repetition report of 2026-11-06.  Default on. */
+        private const val SETTING_RTP_GATE = "callagent_rtp_gate"
+
+        /** Registry key: `0` to drain the reservoir at exactly 1:1 instead of at
+         *  the fractional rate [PlaybackSlip.stepFor] asks for, leaving the
+         *  interpolation out of the call while the reservoir, its prefill and its
+         *  ceiling all stay.  Default on. */
+        private const val SETTING_PLAYBACK_SLIP = "callagent_playback_slip"
+
+        /** Registry key: how the playback loop feeds its track — frames of room
+         *  kept in front of the sink before a refusal turns into a loss.  `0` is
+         *  build 470's contract (a refusal discards, but paced and counted), `-1`
+         *  is build 470 exactly as shipped (unpaced), `1..10` is that many frames
+         *  of staging, up to [PlaybackWriter.MAX_QUEUE_FRAMES].  `-2`, or no value
+         *  at all, means "choose by route": staging on `callagent_uplink_via=0`,
+         *  where the write is measured to jam, build 470's own write on the
+         *  acoustic routes, where it is not.  See the [playStage] note.
+         *
+         *  This is the switch that makes the 2026-11-07 loss measurable on one
+         *  call instead of arguable: see [PlaybackWriter] for the two numbers and
+         *  `gateway-test/gw-uplink-hardening-470.md` for how to use it. */
+        private const val SETTING_PLAY_STAGE = "callagent_play_stage"
+
+        /** [SETTING_PLAY_STAGE] value meaning "whatever the route this call took
+         *  calls for".  Also the value a device with no setting written reads,
+         *  since [globalFlag] hands back its default and that default is this.
+         *  Kept away from `-1`, which means something else. */
+        private const val PLAY_STAGE_FOLLOW_ROUTE = -2
+
+        /** Frame level above which a playback frame is counted as loud for the
+         *  per-window witness (`playWinLoud`/`playWinMax`).
+         *
+         *  8000 RMS: the test tone written at amp 12000 arrives through A-law at
+         *  about 11800, while ordinary speech sits in the thousands and only
+         *  peaks past this.  The count, times the 20 ms frame length, is the
+         *  length of what was spoken in that window — the number that shows
+         *  whether a press lasted the 200 ms it was asked for.  Best-effort by
+         *  design: the increment is not synchronised against the stats thread's
+         *  reset, so a lost frame is possible and changes nothing that matters. */
+        private const val PLAYBACK_WINDOW_LOUD_FLOOR = 8000
     }
 }
 

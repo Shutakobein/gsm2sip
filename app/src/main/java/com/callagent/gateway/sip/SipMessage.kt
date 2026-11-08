@@ -1,5 +1,6 @@
 package com.callagent.gateway.sip
 
+import android.util.Log
 import com.callagent.gateway.rtp.SrtpKeys
 
 /**
@@ -241,10 +242,20 @@ class SipMessage private constructor(
     companion object {
         private val HEADER_SEPARATOR = Regex("\\r?\\n\\r?\\n")
         private val STATUS_CODE = Regex("^SIP/\\S+\\s+(\\d{3})(?:\\s+.*)?$", RegexOption.IGNORE_CASE)
+        private const val TAG = "SipMessage"
+
+        /** A peer that sends no body sometimes says so with this header, which is
+         *  the only claim we can check before completing a message for it. */
+        private val CONTENT_LENGTH =
+            Regex("^content-length\\s*:\\s*([0-9]+)\\s*$", setOf(RegexOption.MULTILINE, RegexOption.IGNORE_CASE))
+
+        /** Requests that never carry a body, so a missing empty line after the
+         *  headers cannot be hiding anything.  INVITE is deliberately absent. */
+        private val BODYLESS_REQUEST = Regex("^(BYE|CANCEL|ACK|OPTIONS|REGISTER|INFO|NOTIFY|MESSAGE|SUBSCRIBE)\\s")
 
         /** Parse a raw SIP message string */
         fun parse(data: String): SipMessage? {
-            val separator = HEADER_SEPARATOR.find(data) ?: return null
+            val separator = HEADER_SEPARATOR.find(data) ?: return parseUnterminatedRequest(data)
             val headerSection = data.substring(0, separator.range.first)
             val body = data.substring(separator.range.last + 1)
             val lines = headerSection.split(Regex("\\r?\\n"))
@@ -269,6 +280,42 @@ class SipMessage private constructor(
             }
 
             return SipMessage(startLine, headers, body).also { it.raw = data }
+        }
+
+        /**
+         * A request that ends with a single CRLF after its last header, where
+         * RFC 3261's grammar wants an empty line closing the header block.
+         *
+         * A correct peer always sends that empty line, but discarding the
+         * request anyway is what makes the fault expensive: a BYE that is
+         * dropped is a cellular call that keeps running, and the gateway never
+         * learns that the far end asked it to hang up.  Seen on 2026-11-05 with
+         * a Python test client that built exactly such a BYE - the client sent
+         * it, logged it as sent, the app parsed nothing and said nothing, and
+         * the call outlived its window until the network ended it.
+         *
+         * So complete the terminator and parse.  Only for requests that carry no
+         * body, because a truncated INVITE read as complete would dial whatever
+         * the fragment named, and only when a Content-Length, if present, agrees
+         * that there is no body.  And say out loud that the sender is malformed:
+         * leniency must not be as quiet as the strict drop it replaces.
+         */
+        private fun parseUnterminatedRequest(data: String): SipMessage? {
+            val first = data.substringBefore('\n').trim()
+            if (!BODYLESS_REQUEST.containsMatchIn(first)) return null
+            CONTENT_LENGTH.find(data)?.let {
+                if ((it.groupValues[1].toLongOrNull() ?: 0L) != 0L) return null
+            }
+            // Complete the terminator properly rather than just appending one: a
+            // sender that already closed its last header with a CRLF would else
+            // leave a stray line break inside the parsed body.
+            val completed = data.trimEnd('\r', '\n') + "\r\n\r\n"
+            val msg = parse(completed) ?: return null
+            Log.w(TAG, "Accepted a ${msg.method ?: "bodyless"} request whose headers were not " +
+                "ended by a blank line (${data.length}B, RFC 3261 section 7 wants CRLF CRLF " +
+                "before the body); the sender is malformed, but dropping this request " +
+                "would have left the call running")
+            return msg
         }
 
         private fun extractTag(header: String): String? {
@@ -316,6 +363,66 @@ object SipBuilder {
     private fun branch(): String = "z9hG4bK${(100000000..999999999).random()}"
     private fun tag(): String = "gw${(100000000..999999999).random()}"
 
+    private const val HEX = "0123456789ABCDEF"
+
+    /**
+     * The user part of a SIP URI, percent-encoded.
+     *
+     * RFC 3261 section 25.1 permits very little in that position: letters,
+     * digits and a few markers.  Everything the gateway puts there comes from
+     * the radio and is free text -- an alphanumeric sender ("KIA TURKIYE"), a
+     * number with separators, a name in another alphabet -- and a raw space in
+     * the angle-bracketed URI is not a minor blemish but a parse failure: the
+     * server's stack drops the *whole packet* before it answers anything.  Measured
+     * on 2026-11-06 against Asterisk 22, which logged
+     * "Dropping 897 bytes packet from UDP 192.168.0.6:5062 : PJSIP syntax error
+     * exception when parsing 'From' header on line 6 col 17" and the gateway
+     * waited out its timeout for a message the server never looked at.
+     *
+     * `+` stays literal on purpose: an E.164 Request-URI has to remain
+     * `_+X.`-matchable in the dialplan, so encoding it would break routing.
+     */
+    internal fun encodeSipUser(raw: String): String {
+        // ASCII-only fast path.  isLetterOrDigit() would count a Turkish or
+        // Cyrillic letter as fine here, and those are exactly what has to be
+        // encoded; the byte loop below handles them.
+        if (raw.all { (it in 'a'..'z') || (it in 'A'..'Z') || (it in '0'..'9') || it in "+-._~" }) {
+            return raw
+        }
+        val out = StringBuilder(raw.length + 8)
+        for (byte in raw.toByteArray(Charsets.UTF_8)) {
+            val c = byte.toInt() and 0xFF
+            if ((c in 'a'.code..'z'.code) || (c in 'A'.code..'Z'.code) || (c in '0'.code..'9'.code) ||
+                c == '+'.code || c == '-'.code || c == '.'.code || c == '_'.code || c == '~'.code
+            ) {
+                out.append(c.toChar())
+            } else {
+                out.append('%').append(HEX[c shr 4]).append(HEX[c and 0x0F])
+            }
+        }
+        return out.toString()
+    }
+
+    /**
+     * A header line with any CR or LF removed.
+     *
+     * These lines carry text from the network and the modem: sender, number,
+     * carrier name, a failure reason.  A line break inside one ends the header
+     * and starts another, so the rest of the request becomes whatever that text
+     * wanted it to be.  Parsed values cannot carry a break (continuation lines
+     * are folded into a space), so this only guards what goes out.
+     */
+    internal fun headerLine(line: String): String =
+        if (line.indexOf('\r') < 0 && line.indexOf('\n') < 0) line
+        else line.replace("\r", "").replace("\n", "")
+
+    /** A display name for a quoted-string, with the quoting kept intact. */
+    private fun quotedName(name: String): String {
+        val clean = name.filter { it != '\r' && it != '\n' }
+        val escaped = clean.replace("\\", "\\\\").replace("\"", "\\\"")
+        return "\"$escaped\""
+    }
+
     fun register(
         username: String, domain: String, serverPort: Int,
         localIp: String, localPort: Int,
@@ -350,8 +457,12 @@ object SipBuilder {
         auth: String? = null,
         srtp: SrtpKeys? = null
     ): String {
-        val fromDisplay = if (callerIdName != null) "\"$callerIdName\" " else ""
-        val fromUser = callerIdNumber ?: username
+        val fromDisplay = if (callerIdName != null) "${quotedName(callerIdName)} " else ""
+        // The caller number arrives from the server and is free text: a soft
+        // phone may present "021 555 0100" or a name.  A space in the URI makes
+        // the server's parser reject the INVITE outright, exactly as it does a
+        // MESSAGE, so the call would never reach the radio at all.
+        val fromUser = encodeSipUser(callerIdNumber ?: username)
         val sdp = buildSdp(localIp, localRtpPort, srtp)
         return buildString {
             append("INVITE $targetUri SIP/2.0\r\n")
@@ -377,6 +488,11 @@ object SipBuilder {
      * Content-Length counts *bytes*: SMS text is UTF-8 and a message with any
      * non-ASCII character in it would otherwise declare a length shorter than
      * what goes on the wire, and the server would truncate the body.
+     *
+     * [targetUri] is used as it arrives: whoever builds it encodes its user
+     * part with [encodeSipUser], because that is where the routing-relevant
+     * form of the number is known.  [fromUser] is encoded here because the
+     * callers hold a sender name, not a URI-safe token.
      */
     fun message(
         targetUri: String,
@@ -394,10 +510,10 @@ object SipBuilder {
         append("Max-Forwards: 70\r\n")
         append("User-Agent: $userAgent\r\n")
         append("To: <$targetUri>\r\n")
-        append("From: <sip:$fromUser@$domain>;tag=$fromTag\r\n")
+        append("From: <sip:${encodeSipUser(fromUser)}@$domain>;tag=$fromTag\r\n")
         append("Call-ID: $callId\r\n")
         append("CSeq: $cseq MESSAGE\r\n")
-        for (h in extraHeaders) append("$h\r\n")
+        for (h in extraHeaders) append(headerLine(h)).append("\r\n")
         if (auth != null) append(auth)
         append("Content-Type: $contentType\r\n")
         append("Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n\r\n")
@@ -427,7 +543,7 @@ object SipBuilder {
             append("Call-ID: ${msg.callId}\r\n")
             append("CSeq: ${msg.cseq}\r\n")
             append("User-Agent: $userAgent\r\n")
-            for (h in extraHeaders) append("$h\r\n")
+            for (h in extraHeaders) append(headerLine(h)).append("\r\n")
             append("Content-Length: 0\r\n\r\n")
         }
     }
