@@ -28,13 +28,19 @@ silent.  Four chip families do it, each in its own way:
 | Chip family | Verified on | Agent → caller | Caller → agent |
 |---|---|---|---|
 | Qualcomm | Poco X3 NFC (SM6150/SM7150), Galaxy S4 Mini (MSM8960) | `incall_music` into the modem uplink | `VOICE_DOWNLINK`, `VOC_REC_*` |
-| Samsung Exynos | Galaxy S10e (Exynos 9820) | played into the ABOX DSP in place of the mic | tapped off the ABOX downlink |
+| Samsung Exynos | Galaxy S10e (Exynos 9820), Galaxy S20+ (Exynos 990) | played into the ABOX DSP in place of the mic (S10e); an AudioFlinger mix the modem's own record client reads (S20+) | tapped off the ABOX downlink (S10e); the call's own playback stream, read through a matching mix (S20+) |
 | MediaTek | Ulefone Metal (MT6753) | the modem's background-sound player | `VOICE_DOWNLINK` |
 | Google Tensor | Pixel 7 (gs201) | `incall playback` → Telephony Tx | the AoC telephony-rx PCM, over root |
 
 The S10e was listed here as impossible for a long time: its audio HAL has no
 telephony path at all.  It now works by going past the HAL, straight to the
 DSP — see [The Galaxy S10e](#the-galaxy-s10e-past-the-hal-through-the-abox).
+The S20+ is that family's other dead end: its ABOX matrix cannot be driven
+either, because the kernel module that reports position panics that device on
+load.  There the call is taken over one level up instead, inside AudioFlinger:
+an injector mix the modem's own record client is made to read, and a players
+mix whose stream becomes our capture.  No kernel module, no mixer writes, and
+nothing on the handset is muted by default.
 The Magisk module makes the app a privileged system app, grants what it needs
 on a headless phone, and ships the root tools and the S10e's kernel module.
 
@@ -63,6 +69,7 @@ remote actually offered rather than failing a call over a preference.
 | Ulefone Metal (`metal`) | MediaTek MT6753 (MT6735 family) | digital, via the modem's background-sound player | digital, via `VOICE_DOWNLINK` | working on madOS 8.1 (Android 8.1); verified on live calls, see [MediaTek](#mediatek-mt6735mt6753) |
 | Google Pixel 7 (`panther`) | Google Tensor G2 (gs201), AoC audio DSP | digital, via `incall playback` → `Telephony Tx` | digital, via `tinycap` on the AoC telephony-rx PCM (root) | **working** on LineageOS 24 (Android 17), verified on live VoLTE calls |
 | Samsung Galaxy S10e (`beyond0lte`) | Exynos 9820, CS47L93 | digital, played into the ABOX in place of the mic | digital, tapped off the ABOX downlink | **working** on LineageOS 23.2, with `abox_pos.ko` |
+| Samsung Galaxy S20+ (`y2s`) | Exynos 990 (`universal990`) | digital, through a call-redirection AudioPolicy: an injector mix the modem's own record client reads | digital, a players mix feeding an `AudioRecord` of ours | **working** on LineageOS 24 (Android 17), verified on live calls on the `callagent_uplink_via=0` route |
 
 **The Poco X3 NFC is the reference device and works fully**: G.722 wideband in
 both directions, entirely through the modem, with the handset's own microphone
@@ -162,6 +169,7 @@ What has actually been checked so far:
 | Pixel 4a | SM7150 | Google | recognised by the check, used by a contributor |
 | Pixel 7 | Tensor G2 (gs201) | LineageOS 24 | fully working, verified on live VoLTE calls (both directions digital, SMS both ways) |
 | Galaxy S10e | Exynos 9820 | LineageOS 23.2 | working with `abox_pos.ko`, verified on a live call |
+| Galaxy S20+ | Exynos 990 | LineageOS 24 (Android 17, nightly `y2s`) | working on live calls, both directions digital and measured; the far legs were the automated gate, so a person at the far end on this route and calls past 33 s stay open |
 
 Everything the working profile depends on is generic Qualcomm audio, so other
 Qualcomm phones are plausible candidates — but the deciding factors live in the
