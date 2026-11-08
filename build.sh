@@ -215,12 +215,60 @@ build_magisk() {
     cp "$SCRIPT_DIR/gateway.apk" "$SCRIPT_DIR/magisk/system/priv-app/Gateway/Gateway.apk"
     echo "Included APK as priv-app in Magisk module"
 
-    cd "$SCRIPT_DIR/magisk"
-    rm -f "$SCRIPT_DIR/gateway-magisk.zip"
-    zip -r "$SCRIPT_DIR/gateway-magisk.zip" . \
-        -x "*.DS_Store" -x "__MACOSX/*"
-    echo "Magisk module: $SCRIPT_DIR/gateway-magisk.zip"
-    cd "$SCRIPT_DIR"
+    # Pack the module.  Beyond the bytes, this step has to get two things right:
+    # it must not destroy the ZIP it is replacing, and it must fail loudly.  The
+    # old form deleted gateway-magisk.zip and only then ran `zip`, which Git Bash
+    # for Windows does not ship - the run died on that line and left no module at
+    # all, with the previous one already gone.  So the archive is now built as
+    # gateway-magisk.zip.tmp, read back with `unzip -t`, checked for the files a
+    # flash needs, and moved into place only once it is known to be complete.
+    # The trap covers a build that dies anywhere else, so no .tmp is left behind.
+    local zip_out="$SCRIPT_DIR/gateway-magisk.zip"
+    local zip_tmp="$SCRIPT_DIR/gateway-magisk.zip.tmp"
+    rm -f "$zip_tmp"
+    # Armed here, cleared at the end of this function.  Every failure path below
+    # just returns, so the trap is what removes the half-written archive - the
+    # negative test in the review caught a version of this that cleared the trap
+    # on a failure path and left a gateway-magisk.zip.tmp behind.
+    trap "rm -f \"$zip_tmp\"" EXIT
+
+    # Upstream's own path wherever Info-ZIP is installed.  tools/mkzip.py is the
+    # fallback for environments without it, and writes the same archive shape:
+    # relative paths, no wrapper directory, dotfiles kept (the empty
+    # PermissionController/.replace is a name, not content), and unix mode bits
+    # marking the scripts and ALSA tools executable.
+    if command -v zip &>/dev/null; then
+        (cd "$SCRIPT_DIR/magisk" && zip -r "$zip_tmp" . \
+            -x "*.DS_Store" -x "__MACOSX/*")
+    elif command -v python3 &>/dev/null; then
+        python3 "$SCRIPT_DIR/tools/mkzip.py" "$zip_tmp" "$SCRIPT_DIR/magisk"
+    else
+        echo "ERROR: no ZIP packager found.  Install zip, or run the build where"
+        echo "       python3 is available so tools/mkzip.py can pack the module."
+        return 1
+    fi
+
+    # A module that flashes but carries no APK is the quiet failure: install.sh
+    # copies whatever APK the device already has into priv-app (see its fallback),
+    # so the build that looked successful installs an old build.
+    if ! unzip -t "$zip_tmp" >/dev/null; then
+        echo "ERROR: the new module ZIP failed 'unzip -t'; the previous"
+        echo "       gateway-magisk.zip is left untouched."
+        return 1
+    fi
+    for must in module.prop install.sh service.sh post-fs-data.sh \
+                META-INF/com/google/android/update-binary \
+                system/priv-app/Gateway/Gateway.apk; do
+        if ! unzip -l "$zip_tmp" | grep -q "$must\$"; then
+            echo "ERROR: $must is missing from the module archive."
+            echo "       The previous gateway-magisk.zip is left untouched."
+            return 1
+        fi
+    done
+
+    mv -f "$zip_tmp" "$zip_out"
+    trap - EXIT
+    echo "Magisk module: $zip_out"
 }
 
 # ── Install to device (if connected via ADB) ────────
