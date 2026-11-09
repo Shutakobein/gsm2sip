@@ -169,7 +169,7 @@ What has actually been checked so far:
 | Pixel 4a | SM7150 | Google | recognised by the check, used by a contributor |
 | Pixel 7 | Tensor G2 (gs201) | LineageOS 24 | fully working, verified on live VoLTE calls (both directions digital, SMS both ways) |
 | Galaxy S10e | Exynos 9820 | LineageOS 23.2 | working with `abox_pos.ko`, verified on a live call |
-| Galaxy S20+ | Exynos 990 | LineageOS 24 (Android 17, nightly `y2s`) | working on live calls, both directions digital and measured; the far legs were the automated gate, so a person at the far end on this route and calls past 33 s stay open |
+| Galaxy S20+ | Exynos 990 | LineageOS 24 (Android 17, nightly `y2s`) | working on live calls, both directions digital and measured |
 
 Everything the working profile depends on is generic Qualcomm audio, so other
 Qualcomm phones are plausible candidates — but the deciding factors live in the
